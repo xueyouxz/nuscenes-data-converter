@@ -34,6 +34,7 @@
 | 3D 目标检测框 | `messages/*.glb` → `primitives./objects/bounds` | 世界坐标系 |
 | 相机图像（×6） | `messages/*.glb` → `primitives./camera/<CHANNEL>` | Ego 坐标系（附内外参） |
 | 自车未来轨迹 | `messages/*.glb` → `primitives./ego/fut_trajectory` | 世界坐标系 |
+| SparseDrive 规划轨迹 | `messages/*.glb` → `primitives./ego/planning_trajectory` | 世界坐标系 |
 | 对象未来轨迹 | `messages/*.glb` → `primitives./objects/fut_trajectories` | 世界坐标系 |
 | 相机内外参 | `metadata.glb` → `data.cameras` | — |
 | 矢量地图（×8 图层） | `metadata.glb` → `data.map` | 世界坐标系 |
@@ -189,7 +190,10 @@ nuviz 字段内通过 JSON Pointer 引用 accessor 和 image：
       "/camera/CAM_BACK":        { "category": "PRIMITIVE", "type": "image", "coordinate": "ego" },
       "/camera/CAM_BACK_LEFT":   { "category": "PRIMITIVE", "type": "image", "coordinate": "ego" },
       "/camera/CAM_BACK_RIGHT":  { "category": "PRIMITIVE", "type": "image", "coordinate": "ego" },
-      "/map":                    { "category": "PRIMITIVE", "type": "map_geometry", "coordinate": "world" }
+      "/map":                    { "category": "PRIMITIVE", "type": "map_geometry", "coordinate": "world" },
+      "/ego/fut_trajectory":     { "category": "PRIMITIVE", "type": "ego_trajectory", "coordinate": "world" },
+      "/ego/planning_trajectory":{ "category": "PRIMITIVE", "type": "planning_trajectory", "coordinate": "world" },
+      "/objects/fut_trajectories": { "category": "PRIMITIVE", "type": "object_trajectories", "coordinate": "world" }
     },
     "cameras": {
       "CAM_FRONT": {
@@ -272,6 +276,7 @@ nuviz 字段内通过 JSON Pointer 引用 accessor 和 image：
 | `/camera/<CHANNEL>` | PRIMITIVE | image | ego | 相机图像，附相机外参（来自 calibrated_sensor，描述 sensor→ego 方向） |
 | `/map` | PRIMITIVE | map_geometry | world | 矢量地图图层多边形，存于 `metadata.glb`，不随帧变化 |
 | `/ego/fut_trajectory` | PRIMITIVE | ego_trajectory | world | 自车从当前帧到末帧的未来位置序列 |
+| `/ego/planning_trajectory` | PRIMITIVE | planning_trajectory | world | SparseDrive `final_planning` 规划轨迹，index 0 为当前帧自车位置 |
 | `/objects/fut_trajectories` | PRIMITIVE | object_trajectories | world | 当前帧所有对象的未来中心点序列（CSR 格式） |
 
 #### `cameras`
@@ -326,6 +331,9 @@ nuviz 字段内通过 JSON Pointer 引用 accessor 和 image：
           "/objects/bounds": { "cuboids":  [...] },
           "/camera/CAM_FRONT":      { "images": [...] },
           "/camera/CAM_FRONT_LEFT": { "images": [...] },
+          "/ego/fut_trajectory": { "trajectory": [...] },
+          "/ego/planning_trajectory": { "trajectory": [...] },
+          "/objects/fut_trajectories": { "trajectories": [...] },
           ...
         }
       }
@@ -523,7 +531,36 @@ M 为当前帧的目标总数（即 `sample.anns` 列表长度）。
 
 ---
 
-### 6.6 对象未来轨迹
+### 6.6 SparseDrive 规划轨迹
+
+路径：`data.updates[0].primitives."/ego/planning_trajectory"`
+
+```json
+{
+  "trajectory": [
+    {
+      "poses": "#/accessors/N",
+      "count": 7
+    }
+  ]
+}
+```
+
+#### accessor 数据格式
+
+| accessor 引用 | glTF type | componentType | dtype | shape | 说明 |
+|---|---|---|---|---|---|
+| `poses` | VEC3 | FLOAT (5126) | float32 | (T, 3) | SparseDrive `final_planning` 转换到世界坐标系后的规划轨迹 `[x, y, z]`，单位：米；T = 实际轨迹点数 |
+
+**语义**：该流表示模型预测的自车规划轨迹，独立于 `/ego/fut_trajectory` 的 GT 自车未来轨迹。`SparseDriveExtractor.extract_planning()` 会在 `final_planning` 前添加 ego 原点，因此 `poses[0]` 对应当前帧自车位置。
+
+**缺预测处理**：若某帧没有 SparseDrive 预测结果，该帧不写入 `/ego/planning_trajectory` primitive；消费方应按帧判断该 key 是否存在。
+
+**写入规则**：转换器直接读取 SparseDrive pkl，复用 `data_converter.core.sparsedrive_extractor.SparseDriveExtractor.extract_planning()` 将 `final_planning` 转换到世界坐标系，再补齐 `z=0.0` 写入 VEC3 accessor。
+
+---
+
+### 6.7 对象未来轨迹
 
 路径：`data.updates[0].primitives."/objects/fut_trajectories"`
 
@@ -1152,7 +1189,43 @@ if poses is not None:
 
 ---
 
-### 10.7 提取对象未来轨迹
+### 10.7 提取 SparseDrive 规划轨迹
+
+```python
+import numpy as np
+
+def extract_planning_trajectory(scene_dir, frame_idx):
+    """
+    提取指定帧的 SparseDrive final_planning 规划轨迹（世界坐标系）。
+    返回：
+        poses: (T, 3) float32，index 0 为当前帧自车位置；
+               缺预测时返回 None。
+    """
+    scene_dir = Path(scene_dir)
+    index = json.loads((scene_dir / 'message_index.json').read_text())
+    entry = index['messages'][frame_idx]
+
+    json_data, bin_data = parse_glb(scene_dir / entry['file'])
+    nuviz  = json_data['nuviz']
+    update = nuviz['data']['updates'][0]
+    planning = update['primitives'].get('/ego/planning_trajectory')
+    if planning is None:
+        return None
+
+    traj = planning['trajectory'][0]
+    poses = read_accessor(json_data, bin_data, traj['poses'])  # (T, 3)
+    return poses
+
+# 示例：读取第 5 帧模型规划轨迹
+poses = extract_planning_trajectory('output/scene-0916', frame_idx=5)
+if poses is not None:
+    print(f'规划轨迹点数: {len(poses)}')
+    print(f'当前帧位置:   {poses[0]}')
+```
+
+---
+
+### 10.8 提取对象未来轨迹
 
 ```python
 import numpy as np
@@ -1229,9 +1302,11 @@ BIN chunk
 ├── [padding]
 ├── [bufferView 13] /ego/fut_trajectory poses        float32 (M, 3)
 ├── [padding]
-├── [bufferView 14] /objects/fut_trajectories points   float32 (T, 3)
+├── [bufferView 14] /ego/planning_trajectory poses   float32 (T, 3)
 ├── [padding]
-└── [bufferView 15] /objects/fut_trajectories offsets  uint32  (M+1,)
+├── [bufferView 15] /objects/fut_trajectories points   float32 (T, 3)
+├── [padding]
+└── [bufferView 16] /objects/fut_trajectories offsets  uint32  (M+1,)
 ```
 
 每个 bufferView 通过 `byteOffset` + `byteLength` 精确定位其在 BIN chunk 中的位置，读取时：
@@ -1300,6 +1375,8 @@ NuScenes SDK + NuScenesMap
          │     └── GLBEncoder.add_image()  →  primitives./camera/<CHANNEL>
          ├── _build_ego_fut_trajectory()
          │     └── ego_all[K:]  →  GLBEncoder.add_accessor()  →  primitives./ego/fut_trajectory
+         ├── _build_planning_trajectory()
+         │     └── SparseDrive final_planning  →  GLBEncoder.add_accessor()  →  primitives./ego/planning_trajectory
          ├── _build_objects_fut_trajectories()
          │     ├── _get_obj_future_for_frame()  → 按 track_id 过滤未来点
          │     └── GLBEncoder.add_accessor() ×2  →  primitives./objects/fut_trajectories
@@ -1313,5 +1390,3 @@ visualize_map.py                         （离线可视化，按需运行）
 ```
 
 ---
-
- 

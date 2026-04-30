@@ -121,6 +121,11 @@ class MetadataBuilder:
             "type":        "ego_trajectory",
             "coordinate": "world",
         }
+        streams["/ego/planning_trajectory"] = {
+            "category":   "PRIMITIVE",
+            "type":        "planning_trajectory",
+            "coordinate": "world",
+        }
         streams["/objects/fut_trajectories"] = {
             "category":   "PRIMITIVE",
             "type":        "object_trajectories",

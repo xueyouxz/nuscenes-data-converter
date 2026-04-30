@@ -1,11 +1,17 @@
 import json
+import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 from tqdm import tqdm
 
 from nuscenes.nuscenes import NuScenes
 from nuscenes.utils import splits
+from pyquaternion import Quaternion
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from metadata_builder import MetadataBuilder
 from message_builder import MessageBuilder
@@ -15,6 +21,7 @@ from message_builder import MessageBuilder
 NUSCENES_VERSION  = "v1.0-trainval"
 NUSCENES_DATAROOT = "/home/public/nuscenes_datasets/nuscenes-trainval"
 OUTPUT_ROOT       = "/home/zhangxueyou/PycharmProjects/nuscenes-data-converter/nusviz/output"
+SPARSEDRIVE_PREDICTION = None
 DEFAULT_SPLIT     = "val"
 
 _SPLIT_SCENE_NAMES = {
@@ -26,6 +33,29 @@ _SPLIT_SCENE_NAMES = {
 }
 
 
+class _NuVizEgoPoseAdapter:
+    """为 SparseDriveExtractor 提供所需的 extract_ego_pose 接口。"""
+
+    def __init__(self, nusc: NuScenes):
+        self.nusc = nusc
+
+    def extract_ego_pose(self, sample_token: str) -> Dict[str, object]:
+        from nuscenes.eval.common.utils import quaternion_yaw
+
+        sample = self.nusc.get('sample', sample_token)
+        lidar_sd = self.nusc.get('sample_data', sample['data']['LIDAR_TOP'])
+        ego_pose = self.nusc.get('ego_pose', lidar_sd['ego_pose_token'])
+        rotation = Quaternion(ego_pose['rotation'])
+
+        return {
+            'sample_token': sample_token,
+            'translation': ego_pose['translation'],
+            'rotation': rotation.q.tolist(),
+            'yaw': float(quaternion_yaw(rotation)),
+            'timestamp': sample['timestamp'],
+        }
+
+
 class NuScenesConverter:
     """将 NuScenes 数据集转换为 nuviz 格式。"""
 
@@ -34,14 +64,26 @@ class NuScenesConverter:
         dataroot: str = NUSCENES_DATAROOT,
         version: str = NUSCENES_VERSION,
         output_root: str = OUTPUT_ROOT,
+        sparsedrive_prediction: Optional[str] = SPARSEDRIVE_PREDICTION,
     ):
         self.dataroot    = dataroot
         self.version     = version
         self.output_root = Path(output_root)
+        self.sparsedrive_prediction = sparsedrive_prediction
 
         print(f"Loading nuScenes {version} from {dataroot}...")
         self.nusc = NuScenes(version=version, dataroot=dataroot, verbose=True)
         print(f"Loaded {len(self.nusc.scene)} scenes")
+
+        self.sd_extractor = None
+        if sparsedrive_prediction:
+            from data_converter.core.sparsedrive_extractor import SparseDriveExtractor
+
+            print(f"Loading SparseDrive predictions from {sparsedrive_prediction}...")
+            self.sd_extractor = SparseDriveExtractor(
+                sparsedrive_prediction,
+                _NuVizEgoPoseAdapter(self.nusc),
+            )
 
     def convert_split(self, split: str = DEFAULT_SPLIT):
         """
@@ -96,6 +138,9 @@ class NuScenesConverter:
             # 对象未来轨迹：与当前帧 anns 顺序严格对应
             obj_future = self._get_obj_future_for_frame(sample, idx, obj_all)
 
+            # SparseDrive final_planning：缺预测时不写该 primitive
+            planning_trajectory = self._get_planning_trajectory(sample_token)
+
             update_type = "COMPLETE_STATE" if idx == 0 else "INCREMENTAL"
             msg_bytes   = message_builder.build_message(
                 sample_token,
@@ -104,6 +149,7 @@ class NuScenesConverter:
                 include_cameras=True,
                 include_objects=True,
                 ego_future_poses=ego_future,
+                planning_trajectory=planning_trajectory,
                 obj_future_trajectories=obj_future,
             )
 
@@ -153,6 +199,24 @@ class NuScenesConverter:
             tokens.append(token)
             token = self.nusc.get('sample', token)['next']
         return tokens
+
+    def _get_planning_trajectory(self, sample_token: str) -> Optional[List[List[float]]]:
+        """
+        提取 SparseDrive final_planning 并补齐为 NUSVIZ VEC3 轨迹。
+
+        Returns:
+            list of [x, y, z]，世界坐标系；缺预测时返回 None。
+        """
+        if self.sd_extractor is None:
+            return None
+        if not self.sd_extractor.has_prediction(sample_token):
+            return None
+
+        planning_xy = self.sd_extractor.extract_planning(sample_token)
+        if not planning_xy:
+            return None
+
+        return [[point[0], point[1], 0.0] for point in planning_xy]
 
     def _collect_ego_poses(self, sample_tokens: List[str]) -> List[List[float]]:
         """

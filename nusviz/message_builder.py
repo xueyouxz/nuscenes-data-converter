@@ -78,6 +78,7 @@ class MessageBuilder:
         include_cameras: bool = True,
         include_objects: bool = True,
         ego_future_poses: Optional[List[List[float]]] = None,
+        planning_trajectory: Optional[List[List[float]]] = None,
         obj_future_trajectories: Optional[List[List[List[float]]]] = None,
     ) -> bytes:
         """
@@ -90,6 +91,8 @@ class MessageBuilder:
             include_cameras: 是否包含相机图像
             include_objects: 是否包含目标框
             ego_future_poses: 自车未来轨迹点列表，每项 [x,y,z]，从当前帧（含）到末帧
+            planning_trajectory: SparseDrive final_planning 规划轨迹点列表，
+                                 每项 [x,y,z]，index 0 为当前帧自车位置
             obj_future_trajectories: 对象未来轨迹列表，顺序与 sample['anns'] 对应，
                                      每项为该对象的未来中心点列表 [[x,y,z], ...]
         """
@@ -136,6 +139,11 @@ class MessageBuilder:
             prim = self._build_ego_fut_trajectory(encoder, ego_future_poses)
             if prim:
                 update["primitives"]["/ego/fut_trajectory"] = prim
+
+        if planning_trajectory is not None:
+            prim = self._build_planning_trajectory(encoder, planning_trajectory)
+            if prim:
+                update["primitives"]["/ego/planning_trajectory"] = prim
 
         if obj_future_trajectories is not None:
             prim = self._build_objects_fut_trajectories(encoder, obj_future_trajectories)
@@ -265,6 +273,34 @@ class MessageBuilder:
             "trajectory": [{
                 "poses": f"#/accessors/{poses_acc}",
                 "count": len(ego_future_poses),
+            }]
+        }
+
+    def _build_planning_trajectory(
+        self,
+        encoder: GLBEncoder,
+        planning_trajectory: List[List[float]],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        将 SparseDrive final_planning 编码为 VEC3 accessor。
+
+        Args:
+            encoder: GLBEncoder 实例
+            planning_trajectory: 当前帧的规划轨迹点列表，每项 [x, y, z]，
+                                 世界坐标系，index 0 为当前帧自车位置。
+        Returns:
+            /ego/planning_trajectory primitive JSON，或 None（列表为空时）。
+        """
+        if not planning_trajectory:
+            return None
+
+        poses_arr = np.array(planning_trajectory, dtype=np.float32)
+        poses_acc = encoder.add_accessor(poses_arr, type_str="VEC3")
+
+        return {
+            "trajectory": [{
+                "poses": f"#/accessors/{poses_acc}",
+                "count": len(planning_trajectory),
             }]
         }
 
