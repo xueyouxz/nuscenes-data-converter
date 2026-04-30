@@ -1,0 +1,345 @@
+"""
+Metadata 构建器
+
+生成 metadata.glb 文件（nuviz/metadata 消息）。
+"""
+
+from typing import Dict, Any, List, Optional
+import numpy as np
+from nuscenes.nuscenes import NuScenes
+from nuscenes.map_expansion.map_api import NuScenesMap
+from pyquaternion import Quaternion
+from shapely.geometry import LineString
+from shapely.geometry import CAP_STYLE, JOIN_STYLE
+
+from glb_encoder import GLBEncoder
+from coord_utils import quat_to_wxyz
+
+
+CAMERA_CHANNELS = [
+    'CAM_FRONT',
+    'CAM_FRONT_LEFT',
+    'CAM_FRONT_RIGHT',
+    'CAM_BACK',
+    'CAM_BACK_LEFT',
+    'CAM_BACK_RIGHT',
+]
+
+# nuScenes 类别名称 -> ID 映射
+NUSCENES_CATEGORIES = {
+    "barrier":              1,
+    "bicycle":              2,
+    "bus":                  3,
+    "car":                  4,
+    "construction_vehicle": 5,
+    "motorcycle":           6,
+    "pedestrian":           7,
+    "traffic_cone":         8,
+    "trailer":              9,
+    "truck":                10,
+    "driveable_surface":    11,
+    "other_flat":           12,
+    "sidewalk":             13,
+    "terrain":              14,
+    "manmade":              15,
+    "vegetation":           16,
+}
+
+# 各地图的画布边界 [xmin, ymin, xmax, ymax]（单位：米）
+_MAP_BOUNDS: Dict[str, List[float]] = {
+    "singapore-onenorth":       [-300.0,  -1500.0, 1500.0, 1000.0],
+    "singapore-hollandvillage": [-300.0,  -1500.0, 1500.0, 1000.0],
+    "singapore-queenstown":     [-300.0,  -1500.0, 1500.0, 1000.0],
+    "boston-seaport":           [-2000.0, -1000.0, 2000.0, 2000.0],
+}
+_DEFAULT_MAP_BOUNDS: List[float] = [-2000.0, -2000.0, 2000.0, 2000.0]
+
+# 需要提取的矢量地图图层
+MAP_LAYERS = [
+    'drivable_area',
+    'road_segment',
+    'lane',
+    'lane_connector',
+    'ped_crossing',
+    'walkway',
+    'stop_line',
+    'carpark_area',
+]
+
+# 轨迹缓冲半径（米），覆盖自车两侧约 21 条车道宽度
+BUFFER_RADIUS_M = 75.0
+
+
+class MetadataBuilder:
+    """从 NuScenes 场景构建 nuviz/metadata GLB 文件。"""
+
+    def __init__(self, nusc: NuScenes, scene_token: str, dataroot: Optional[str] = None):
+        self.nusc = nusc
+        self.scene = nusc.get('scene', scene_token)
+        # dataroot 用于实例化 NuScenesMap；若未传入则从 nusc 对象获取
+        self.dataroot = dataroot or nusc.dataroot
+
+    def build(self) -> bytes:
+        """构建并返回 metadata.glb 的字节内容。"""
+        scene = self.scene
+        log_rec = self.nusc.get('log', scene['log_token'])
+        location = log_rec['location']
+
+        first_sample = self.nusc.get('sample', scene['first_sample_token'])
+        last_sample  = self.nusc.get('sample', scene['last_sample_token'])
+        start_time = first_sample['timestamp'] / 1e6
+        end_time   = last_sample['timestamp']  / 1e6
+
+        encoder = GLBEncoder()
+
+        cameras = self._build_cameras(scene['first_sample_token'])
+
+        # 构建地图数据（写入 BIN chunk）
+        map_json = self._build_map(encoder)
+
+        # 固定 streams，相机 streams 动态追加
+        streams = {
+            "/ego_pose":       {"category": "POSE",      "coordinate": "world"},
+            "/lidar":          {"category": "PRIMITIVE", "type": "point",           "coordinate": "world"},
+            "/objects/bounds": {"category": "PRIMITIVE", "type": "nuscenes_cuboid", "coordinate": "world"},
+        }
+        for channel in cameras:
+            streams[f"/camera/{channel}"] = {
+                "category": "PRIMITIVE",
+                "type": "image",
+                "coordinate": "ego",
+            }
+        # 新增 /map 通道声明
+        streams["/map"] = {
+            "category":  "PRIMITIVE",
+            "type":      "map_geometry",
+            "coordinate": "world",
+        }
+        # 新增轨迹流声明
+        streams["/ego/fut_trajectory"] = {
+            "category":   "PRIMITIVE",
+            "type":        "ego_trajectory",
+            "coordinate": "world",
+        }
+        streams["/objects/fut_trajectories"] = {
+            "category":   "PRIMITIVE",
+            "type":        "object_trajectories",
+            "coordinate": "world",
+        }
+
+        metadata = {
+            "type": "nuviz/metadata",
+            "data": {
+                "log_info": {
+                    "start_time": start_time,
+                    "end_time":   end_time,
+                },
+                "streams":    streams,
+                "cameras":    cameras,
+                "map":        map_json,
+                "extensions": {
+                    "nuscenes": {
+                        "scene": {
+                            "scene_token": scene['token'],
+                            "name":        scene['name'],
+                            "description": scene['description'],
+                            "location":    location,
+                            "mapId":       location,
+                        },
+                        "map": {
+                            "canvas_edge_m": _MAP_BOUNDS.get(location, _DEFAULT_MAP_BOUNDS),
+                        },
+                        "coordinate": {
+                            "units":            "meter",
+                            "matrixConvention": "nuscenes",
+                            "quatOrder":        "wxyz",
+                        },
+                        "mapping": {
+                            "classes": {
+                                "nameToId": NUSCENES_CATEGORIES,
+                            }
+                        },
+                    }
+                },
+            },
+        }
+
+        return encoder.encode(metadata)
+
+    def _build_cameras(self, sample_token: str) -> Dict[str, Any]:
+        """读取第一帧各相机的内外参，返回相机信息字典。"""
+        sample = self.nusc.get('sample', sample_token)
+        cameras = {}
+
+        for channel in CAMERA_CHANNELS:
+            if channel not in sample['data']:
+                continue
+
+            cam_data = self.nusc.get('sample_data', sample['data'][channel])
+            cs_rec   = self.nusc.get('calibrated_sensor', cam_data['calibrated_sensor_token'])
+
+            cameras[channel] = {
+                "image_width":  cam_data['width'],
+                "image_height": cam_data['height'],
+                "intrinsic":    np.array(cs_rec['camera_intrinsic']).tolist(),
+                "extrinsic": {
+                    "translation": cs_rec['translation'],
+                    "rotation":    quat_to_wxyz(Quaternion(cs_rec['rotation'])),
+                },
+            }
+
+        return cameras
+
+    def _collect_trajectory(self) -> List[List[float]]:
+        """
+        按时间顺序收集场景内所有帧的 ego_pose XY 坐标。
+
+        Returns:
+            trajectory_xy: list of [x, y]，世界坐标系，单位米
+        """
+        scene = self.scene
+        trajectory_xy = []
+
+        sample_token = scene['first_sample_token']
+        while sample_token:
+            sample   = self.nusc.get('sample', sample_token)
+            lidar_sd = self.nusc.get('sample_data', sample['data']['LIDAR_TOP'])
+            ep       = self.nusc.get('ego_pose', lidar_sd['ego_pose_token'])
+            trajectory_xy.append(ep['translation'][:2])
+            sample_token = sample['next']  # 空字符串时循环终止
+
+        return trajectory_xy
+
+    def _build_map(self, encoder: GLBEncoder) -> Dict[str, Any]:
+        """
+        提取场景矢量地图，将几何数据写入 GLBEncoder，
+        返回写入 nuviz.data.map 的 JSON 字典。
+
+        Args:
+            encoder: GLBEncoder 实例，地图顶点/计数数据将追加至其 BIN chunk
+
+        Returns:
+            map_json: {"buffer_radius_m": ..., "layers": {layer_name: {"vertices": ..., "counts": ...}, ...}}
+        """
+        # ① 收集轨迹
+        trajectory_xy = self._collect_trajectory()
+
+        # ② 构建缓冲多边形（Shapely 1.x API）
+        line        = LineString(trajectory_xy)
+        buffer_poly = line.buffer(
+            BUFFER_RADIUS_M,
+            cap_style=CAP_STYLE.round,
+            join_style=JOIN_STYLE.round,
+        )
+        # patch_box: (xmin, ymin, xmax, ymax)，用于 API 粗筛
+        xmin, ymin, xmax, ymax = buffer_poly.bounds
+        patch_box = (xmin, ymin, xmax, ymax)
+
+        # ③ 实例化 NuScenesMap
+        scene   = self.scene
+        log_rec = self.nusc.get('log', scene['log_token'])
+        nusc_map = NuScenesMap(dataroot=self.dataroot, map_name=log_rec['location'])
+
+        # ④ 逐图层粗筛 + 精筛 + 顶点提取
+        map_layers_json: Dict[str, Any] = {}
+
+        for layer_name in MAP_LAYERS:
+            # 粗筛：矩形查询
+            records_in_patch = nusc_map.get_records_in_patch(
+                patch_box, [layer_name], mode='intersect'
+            )
+            candidate_tokens = records_in_patch.get(layer_name, [])
+
+            all_vertices: List[List[float]] = []
+            all_counts:   List[int]         = []
+
+            for token in candidate_tokens:
+                record = nusc_map.get(layer_name, token)
+
+                # 按图层类型选取正确的几何来源：
+                # - drivable_area / lane_connector 使用 polygon_tokens（复数），
+                #   每个元素才是真实轮廓多边形；其单数字段 polygon_token 仅是
+                #   空间索引粗筛用的 AABB 包围盒，渲染时禁止使用，否则
+                #   lane_connector 会全部退化为轴对齐黄色矩形。
+                # - 当 lane_connector 无复数字段时，退回到 arcline_path_3
+                #   离散化中心线并向两侧 buffer 1.75m 得到近似轮廓。
+                # - 其余图层（lane、road_segment 等）用 polygon_token（单数）。
+                geoms = []
+                if 'polygon_tokens' in record and record['polygon_tokens']:
+                    for pt in record['polygon_tokens']:
+                        try:
+                            geoms.append(nusc_map.extract_polygon(pt))
+                        except Exception:
+                            continue
+                elif layer_name == 'lane_connector':
+                    from nuscenes.map_expansion.arcline_path_utils import discretize_lane
+                    from shapely.geometry import LineString as _LS
+                    arc_path = nusc_map.arcline_path_3.get(token, [])
+                    if arc_path:
+                        try:
+                            poses = discretize_lane(arc_path, resolution_meters=0.5)
+                            if len(poses) >= 2:
+                                cl = _LS([(p[0], p[1]) for p in poses])
+                                geoms.append(cl.buffer(1.75, cap_style=2, join_style=2))
+                        except Exception:
+                            continue
+                elif 'polygon_token' in record and record['polygon_token'] is not None:
+                    try:
+                        geoms.append(nusc_map.extract_polygon(record['polygon_token']))
+                    except Exception:
+                        continue
+
+                for geom in geoms:
+                    # 精筛：与缓冲多边形几何相交
+                    if not buffer_poly.intersects(geom):
+                        continue
+
+                    # 裁剪：求交后只保留缓冲区内的部分。
+                    # 对于 drivable_area 等存在覆盖整张地图的超大多边形的图层，
+                    # 仅用 intersects() 精筛无法限制范围；必须通过 intersection()
+                    # 将几何裁剪到 buffer_poly 边界内，否则整张地图的路网会被
+                    # 全量写入 accessor，导致可视化时地图范围远超自车轨迹区域。
+                    try:
+                        clipped = buffer_poly.intersection(geom)
+                    except Exception:
+                        continue
+
+                    # intersection 结果可能是 Polygon / MultiPolygon / GeometryCollection
+                    from shapely.geometry import MultiPolygon, GeometryCollection
+                    if clipped.is_empty:
+                        continue
+                    if hasattr(clipped, 'exterior'):
+                        clip_polys = [clipped]
+                    elif isinstance(clipped, (MultiPolygon, GeometryCollection)):
+                        clip_polys = [g for g in clipped.geoms if hasattr(g, 'exterior')]
+                    else:
+                        continue
+
+                    for cp in clip_polys:
+                        # 提取外轮廓顶点，去掉闭合重复点
+                        coords = list(cp.exterior.coords)[:-1]
+                        if len(coords) < 3:
+                            continue
+                        for x, y in coords:
+                            all_vertices.append([x, y, 0.0])
+                        all_counts.append(len(coords))
+
+            # 空图层不写入
+            if not all_vertices:
+                continue
+
+            v_arr = np.array(all_vertices, dtype=np.float32)  # (K, 3)
+            c_arr = np.array(all_counts,   dtype=np.uint32)   # (P,)
+
+            v_acc = encoder.add_accessor(v_arr, type_str="VEC3")
+            c_acc = encoder.add_accessor(c_arr, type_str="SCALAR")
+
+            map_layers_json[layer_name] = {
+                "vertices": f"#/accessors/{v_acc}",
+                "counts":   f"#/accessors/{c_acc}",
+            }
+
+        return {
+            "buffer_radius_m": BUFFER_RADIUS_M,
+            "layers":          map_layers_json,
+        }
