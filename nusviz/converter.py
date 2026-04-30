@@ -1,5 +1,6 @@
 import json
 import sys
+import argparse
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -21,7 +22,9 @@ from message_builder import MessageBuilder
 NUSCENES_VERSION  = "v1.0-trainval"
 NUSCENES_DATAROOT = "/home/public/nuscenes_datasets/nuscenes-trainval"
 OUTPUT_ROOT       = "/home/zhangxueyou/PycharmProjects/nuscenes-data-converter/nusviz/output"
-SPARSEDRIVE_PREDICTION = None
+SPARSEDRIVE_PREDICTION = str(
+    _REPO_ROOT / "data/sparsedrive/sparsedrive_stage2_trainval_with_metric.pkl"
+)
 DEFAULT_SPLIT     = "val"
 
 _SPLIT_SCENE_NAMES = {
@@ -77,6 +80,10 @@ class NuScenesConverter:
 
         self.sd_extractor = None
         if sparsedrive_prediction:
+            prediction_path = Path(sparsedrive_prediction)
+            if not prediction_path.exists():
+                raise FileNotFoundError(f"SparseDrive prediction file not found: {sparsedrive_prediction}")
+
             from data_converter.core.sparsedrive_extractor import SparseDriveExtractor
 
             print(f"Loading SparseDrive predictions from {sparsedrive_prediction}...")
@@ -104,6 +111,13 @@ class NuScenesConverter:
         for scene in tqdm(scenes, desc=f"Converting {split}", unit="scene"):
             self.convert_scene(scene['token'])
 
+    def convert_scene_name(self, scene_name: str):
+        """按 scene name 转换单个场景。"""
+        for scene in self.nusc.scene:
+            if scene['name'] == scene_name:
+                return self.convert_scene(scene['token'])
+        raise ValueError(f"Unknown scene name: {scene_name}")
+
     def convert_scene(self, scene_token: str):
         """转换单个场景，输出 metadata.glb、messages/*.glb 和 message_index.json。"""
         scene      = self.nusc.get('scene', scene_token)
@@ -127,6 +141,8 @@ class NuScenesConverter:
         # 3. messages/*.glb
         message_builder = MessageBuilder(self.nusc, self.dataroot)
         message_entries = []
+        planning_source_count = 0
+        planning_written_count = 0
 
         for idx, sample_token in enumerate(samples):
             sample    = self.nusc.get('sample', sample_token)
@@ -140,6 +156,10 @@ class NuScenesConverter:
 
             # SparseDrive final_planning：缺预测时不写该 primitive
             planning_trajectory = self._get_planning_trajectory(sample_token)
+            if self.sd_extractor is not None and self.sd_extractor.has_prediction(sample_token):
+                planning_source_count += 1
+            if planning_trajectory is not None:
+                planning_written_count += 1
 
             update_type = "COMPLETE_STATE" if idx == 0 else "INCREMENTAL"
             msg_bytes   = message_builder.build_message(
@@ -185,6 +205,12 @@ class NuScenesConverter:
         (scene_dir / "message_index.json").write_text(
             json.dumps(message_index, indent=2)
         )
+
+        if self.sd_extractor is not None:
+            print(
+                f"SparseDrive planning written for {planning_written_count}/"
+                f"{planning_source_count} frames with source predictions in {scene_name}"
+            )
 
     # ------------------------------------------------------------------
     # 辅助方法
@@ -290,16 +316,49 @@ class NuScenesConverter:
         return result
 
 
-if __name__ == '__main__':
-    converter = NuScenesConverter(
-        dataroot=NUSCENES_DATAROOT,
-        version=NUSCENES_VERSION,
-        output_root=OUTPUT_ROOT,
+def _default_prediction_path() -> Optional[str]:
+    """Return the repo-local SparseDrive pkl if it exists; otherwise keep planning disabled."""
+    path = Path(SPARSEDRIVE_PREDICTION)
+    return str(path) if path.exists() else None
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Convert nuScenes scenes to NUSVIZ GLB format.")
+    parser.add_argument("--dataroot", default=NUSCENES_DATAROOT, help="nuScenes dataset root")
+    parser.add_argument("--version", default=NUSCENES_VERSION, help="nuScenes version")
+    parser.add_argument("--output-root", default=OUTPUT_ROOT, help="NUSVIZ output root")
+    parser.add_argument("--split", default=None, help="Split to convert, e.g. val or mini_val")
+    parser.add_argument("--scene-name", default=None, help="Convert a single scene by name, e.g. scene-0916")
+    parser.add_argument(
+        "--sparsedrive-prediction",
+        default=_default_prediction_path(),
+        help=(
+            "SparseDrive pkl path. Defaults to the repo-local data/sparsedrive pkl "
+            "when it exists; pass an empty string to disable planning."
+        ),
     )
-    SPLIT = "mini_val"
-    converter.convert_split(SPLIT)
+    args = parser.parse_args()
+
+    sparsedrive_prediction = args.sparsedrive_prediction or None
+
+    converter = NuScenesConverter(
+        dataroot=args.dataroot,
+        version=args.version,
+        output_root=args.output_root,
+        sparsedrive_prediction=sparsedrive_prediction,
+    )
+
+    if args.scene_name:
+        converter.convert_scene_name(args.scene_name)
+    else:
+        converter.convert_split(args.split or DEFAULT_SPLIT)
 
     print(f"\n{'='*80}")
     print(f"Conversion complete!")
-    print(f"Output directory: {OUTPUT_ROOT}")
+    print(f"Output directory: {args.output_root}")
+    print(f"SparseDrive planning: {'enabled' if sparsedrive_prediction else 'disabled'}")
     print(f"{'='*80}\n")
+
+
+if __name__ == '__main__':
+    main()
