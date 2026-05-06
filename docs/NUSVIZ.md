@@ -14,7 +14,7 @@
 6. [messages/XXXXXX.glb — 帧状态消息](#6-messagesxxxxxxglb--帧状态消息)
 7. [坐标系规范](#7-坐标系规范)
 8. [类别 ID 映射](#8-类别-id-映射)
-9. [场景矢量地图](#9-场景矢量地图)
+9. [场景地图（矢量 + 栅格）](#9-场景地图矢量--栅格)
 10. [如何从数据中提取各类模态](#10-如何从数据中提取各类模态)
 11. [GLB 二进制布局详解](#11-glb-二进制布局详解)
 12. [模块文件索引](#12-模块文件索引)
@@ -37,7 +37,8 @@
 | SparseDrive 规划轨迹 | `messages/*.glb` → `primitives./ego/planning_trajectory` | 世界坐标系 |
 | 对象未来轨迹 | `messages/*.glb` → `primitives./objects/fut_trajectories` | 世界坐标系 |
 | 相机内外参 | `metadata.glb` → `data.cameras` | — |
-| 矢量地图（×8 图层） | `metadata.glb` → `data.map` | 世界坐标系 |
+| 矢量地图（×8 图层） | `metadata.glb` → `data.map.layers` | 世界坐标系 |
+| 栅格底图（basemap crop） | `metadata.glb` → `data.map.basemap` → `#/images/N` | 世界坐标系 |
 | 场景元信息 | `metadata.glb` → `data.extensions.nuscenes` | — |
 
 每个 nuScenes **sample**（约 2 Hz 采样）对应一个 `messages/XXXXXX.glb` 文件。
@@ -191,6 +192,7 @@ nuviz 字段内通过 JSON Pointer 引用 accessor 和 image：
       "/camera/CAM_BACK_LEFT":   { "category": "PRIMITIVE", "type": "image", "coordinate": "ego" },
       "/camera/CAM_BACK_RIGHT":  { "category": "PRIMITIVE", "type": "image", "coordinate": "ego" },
       "/map":                    { "category": "PRIMITIVE", "type": "map_geometry", "coordinate": "world" },
+      "/map/basemap":            { "category": "PRIMITIVE", "type": "raster_map", "coordinate": "world" },
       "/ego/fut_trajectory":     { "category": "PRIMITIVE", "type": "ego_trajectory", "coordinate": "world" },
       "/ego/planning_trajectory":{ "category": "PRIMITIVE", "type": "planning_trajectory", "coordinate": "world" },
       "/objects/fut_trajectories": { "category": "PRIMITIVE", "type": "object_trajectories", "coordinate": "world" }
@@ -226,6 +228,34 @@ nuviz 字段内通过 JSON Pointer 引用 accessor 和 image：
         "walkway":       { "vertices": "#/accessors/22", "counts": "#/accessors/23" },
         "stop_line":     { "vertices": "#/accessors/24", "counts": "#/accessors/25" },
         "carpark_area":  { "vertices": "#/accessors/26", "counts": "#/accessors/27" }
+      },
+      "basemap": {
+        "image": "#/images/0",
+        "mimeType": "image/png",
+        "width": 1742,
+        "height": 2263,
+        "bounds": {
+          "min_x": 321.3,
+          "min_y": 1029.6,
+          "max_x": 495.5,
+          "max_y": 1255.9
+        },
+        "resolution": {
+          "meters_per_pixel_x": 0.1,
+          "meters_per_pixel_y": 0.1
+        },
+        "transform": {
+          "origin_x": 321.3,
+          "origin_y": 1255.9,
+          "y_axis_direction": "down"
+        },
+        "source": {
+          "mapId": "singapore-onenorth",
+          "layer": "basemap",
+          "path": "maps/basemap/singapore-onenorth.png",
+          "canvas_edge_m": [0.0, 0.0, 1585.6, 2025.0],
+          "pixel_box": [3213, 7691, 4955, 9954]
+        }
       }
     },
     "extensions": {
@@ -275,6 +305,7 @@ nuviz 字段内通过 JSON Pointer 引用 accessor 和 image：
 | `/objects/bounds` | PRIMITIVE | nuscenes_cuboid | world | 3D 检测框，世界坐标系 |
 | `/camera/<CHANNEL>` | PRIMITIVE | image | ego | 相机图像，附相机外参（来自 calibrated_sensor，描述 sensor→ego 方向） |
 | `/map` | PRIMITIVE | map_geometry | world | 矢量地图图层多边形，存于 `metadata.glb`，不随帧变化 |
+| `/map/basemap` | PRIMITIVE | raster_map | world | 从 nuScenes 原始 `basemap.png` 裁剪出的场景栅格底图，存于 `metadata.glb` 的 `images` |
 | `/ego/fut_trajectory` | PRIMITIVE | ego_trajectory | world | 自车从当前帧到末帧的未来位置序列 |
 | `/ego/planning_trajectory` | PRIMITIVE | planning_trajectory | world | SparseDrive `final_planning` 规划轨迹，index 0 为当前帧自车位置 |
 | `/objects/fut_trajectories` | PRIMITIVE | object_trajectories | world | 当前帧所有对象的未来中心点序列（CSR 格式） |
@@ -306,6 +337,8 @@ nuviz 字段内通过 JSON Pointer 引用 accessor 和 image：
 | singapore-queenstown | -300 | -1500 | 1500 | 1000 |
 | boston-seaport | -2000 | -1000 | 2000 | 2000 |
 | （默认） | -2000 | -2000 | 2000 | 2000 |
+
+> 栅格底图裁剪不使用此历史兼容字段；`data.map.basemap.source.canvas_edge_m` 记录的是 nuScenes `NuScenesMap.canvas_edge` 对应的原始 basemap 画布 `[0, 0, width_m, height_m]`。
 
 ---
 
@@ -742,18 +775,26 @@ return category_name.split('.')[0]
 
 ---
 
-## 9. 场景矢量地图
+## 9. 场景地图（矢量 + 栅格）
 
-矢量地图是 `metadata.glb` 新增的静态数据，场景初始化时加载一次，整个场景复用，不写入任何帧消息（`messages/*.glb`）。
+场景地图是 `metadata.glb` 中的静态数据，场景初始化时加载一次，整个场景复用，不写入任何帧消息（`messages/*.glb`）。
+
+地图包含两类互补表示：
+
+| 表示 | 存储位置 | 说明 |
+|---|---|---|
+| 矢量地图 | `nuviz.data.map.layers` | nuScenes HD map 图层裁剪后的多边形 accessor |
+| 栅格底图 | `nuviz.data.map.basemap` | 从原始 `maps/basemap/<mapId>.png` 裁剪出的场景底图，PNG 字节写入 GLB `images` |
 
 ### 9.1 地图数据结构
 
-地图数据存放在 `nuviz.data.map` 字段中，包含两个顶层字段：
+地图数据存放在 `nuviz.data.map` 字段中，包含以下顶层字段：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `buffer_radius_m` | float | 生成时以自车轨迹为中心线、向两侧延伸的缓冲半径（单位：米），默认 75 |
 | `layers` | object | 按图层名索引，每个图层包含 `vertices` 和 `counts` 两个 accessor 引用 |
+| `basemap` | object | 场景级栅格底图；若原始 basemap 文件不存在，可省略 |
 
 每个图层用两个 accessor 表示：
 
@@ -799,7 +840,71 @@ return category_name.split('.')[0]
 
 缓冲半径 75 m 可覆盖自车两侧约 21 条车道宽度，足以包含完整道路结构及路口附近的地图元素。
 
-### 9.4 BIN chunk 中地图数据的布局
+### 9.4 栅格底图结构
+
+`data.map.basemap` 描述裁剪后的 PNG 栅格底图及其世界坐标定位。图像字节写入 `metadata.glb` 的 BIN chunk，并由 GLB 顶层 `images` 数组引用：
+
+```json
+{
+  "basemap": {
+    "image": "#/images/0",
+    "mimeType": "image/png",
+    "width": 1742,
+    "height": 2263,
+    "bounds": {
+      "min_x": 321.3,
+      "min_y": 1029.6,
+      "max_x": 495.5,
+      "max_y": 1255.9
+    },
+    "resolution": {
+      "meters_per_pixel_x": 0.1,
+      "meters_per_pixel_y": 0.1
+    },
+    "transform": {
+      "origin_x": 321.3,
+      "origin_y": 1255.9,
+      "y_axis_direction": "down"
+    },
+    "source": {
+      "mapId": "singapore-onenorth",
+      "layer": "basemap",
+      "path": "maps/basemap/singapore-onenorth.png",
+      "canvas_edge_m": [0.0, 0.0, 1585.6, 2025.0],
+      "pixel_box": [3213, 7691, 4955, 9954]
+    }
+  }
+}
+```
+
+字段说明：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `image` | string | 指向 GLB 顶层 `images` 数组的 JSON Pointer |
+| `mimeType` | string | 固定为 `"image/png"` |
+| `width`, `height` | int | 裁剪后图像尺寸，单位像素 |
+| `bounds` | object | 裁剪图覆盖的世界坐标范围 `[min_x, min_y, max_x, max_y]`，单位米 |
+| `resolution` | object | 每像素对应的米数，分别记录 x/y 方向 |
+| `transform` | object | 图像左上角在世界坐标中的原点和 y 轴方向 |
+| `source.canvas_edge_m` | float[4] | 原始 basemap 所覆盖的 nuScenes map canvas `[0, 0, width_m, height_m]` |
+| `source.pixel_box` | int[4] | 在原始 basemap PNG 中的裁剪框 `[left, top, right, bottom]` |
+
+裁剪范围与矢量地图使用同一个 `buffer_poly.bounds`。世界坐标与裁剪图像像素坐标的转换为：
+
+```python
+# world -> cropped image pixel
+u = (x - bounds["min_x"]) / resolution["meters_per_pixel_x"]
+v = (bounds["max_y"] - y) / resolution["meters_per_pixel_y"]
+
+# cropped image pixel -> world
+x = bounds["min_x"] + u * resolution["meters_per_pixel_x"]
+y = bounds["max_y"] - v * resolution["meters_per_pixel_y"]
+```
+
+注意：图像坐标原点在左上角，v 轴向下；世界坐标 y 轴向上，因此 y 方向需要翻转。
+
+### 9.5 BIN chunk 中地图数据的布局
 
 地图 accessor 写入 `metadata.glb` 的 BIN chunk，按图层顺序依次排列：
 
@@ -814,10 +919,12 @@ BIN chunk（metadata.glb）
 ├── [bufferView  3]  road_segment   counts     uint32  (P1,)
 ├── [padding]
 ├── ...
-└── [bufferView 15]  carpark_area   counts     uint32  (P7,)
+├── [bufferView 15]  carpark_area   counts     uint32  (P7,)
+├── [padding]
+└── [bufferView 16]  basemap PNG    uint8      image/png bytes
 ```
 
-### 9.5 地图可视化工具
+### 9.6 地图可视化工具
 
 `visualize_map.py` 从已生成的 `metadata.glb` 中读取矢量地图并渲染为 PNG 图像。
 
@@ -1152,7 +1259,60 @@ print(f"Y 范围: {all_verts[:, 1].min():.1f} ~ {all_verts[:, 1].max():.1f} m")
 
 ---
 
-### 10.6 提取自车未来轨迹
+### 10.6 提取栅格底图
+
+栅格底图从 `metadata.glb` 的 `data.map.basemap` 读取，图像字节位于 GLB 顶层 `images` 引用的 bufferView 中。
+
+```python
+from io import BytesIO
+from pathlib import Path
+from PIL import Image
+
+def extract_basemap(scene_dir):
+    """
+    读取场景级栅格底图。
+
+    返回：
+        image:  PIL.Image，裁剪后的 basemap PNG
+        meta:   data.map.basemap 元数据，包含 bounds/resolution/transform/source
+    """
+    json_data, bin_data = parse_glb(Path(scene_dir) / 'metadata.glb')
+    basemap = json_data['nuviz']['data']['map'].get('basemap')
+    if basemap is None:
+        return None, None
+
+    image_idx = int(basemap['image'].split('/')[-1])
+    image_meta = json_data['images'][image_idx]
+    buffer_view = json_data['bufferViews'][image_meta['bufferView']]
+    image_bytes = bin_data[
+        buffer_view['byteOffset'] : buffer_view['byteOffset'] + buffer_view['byteLength']
+    ]
+    return Image.open(BytesIO(image_bytes)), basemap
+
+
+def world_to_basemap_pixel(x, y, basemap):
+    bounds = basemap['bounds']
+    resolution = basemap['resolution']
+    u = (x - bounds['min_x']) / resolution['meters_per_pixel_x']
+    v = (bounds['max_y'] - y) / resolution['meters_per_pixel_y']
+    return u, v
+```
+
+Matplotlib 叠加显示时可直接使用 `bounds` 设置 image extent：
+
+```python
+image, basemap = extract_basemap('output/scene-0916')
+b = basemap['bounds']
+ax.imshow(
+    image,
+    extent=[b['min_x'], b['max_x'], b['min_y'], b['max_y']],
+    origin='upper'
+)
+```
+
+---
+
+### 10.7 提取自车未来轨迹
 
 ```python
 import numpy as np
@@ -1189,7 +1349,7 @@ if poses is not None:
 
 ---
 
-### 10.7 提取 SparseDrive 规划轨迹
+### 10.8 提取 SparseDrive 规划轨迹
 
 ```python
 import numpy as np
@@ -1225,7 +1385,7 @@ if poses is not None:
 
 ---
 
-### 10.8 提取对象未来轨迹
+### 10.9 提取对象未来轨迹
 
 ```python
 import numpy as np
@@ -1332,11 +1492,12 @@ accessor
 | 文件 | 职责 | 核心类/函数 |
 |---|---|---|
 | `converter.py` | 顶层转换入口，遍历 split 中的所有场景，调度 MetadataBuilder 和 MessageBuilder；预计算全场景 ego 轨迹与对象轨迹供各帧复用 | `NuScenesConverter` |
-| `metadata_builder.py` | 构建 `metadata.glb`，提取相机内外参、场景描述、地图范围、类别映射、矢量地图 | `MetadataBuilder` |
+| `metadata_builder.py` | 构建 `metadata.glb`，提取相机内外参、场景描述、地图范围、类别映射、矢量地图和栅格底图 | `MetadataBuilder` |
 | `message_builder.py` | 构建每帧 `messages/XXXXXX.glb`，处理 ego pose、LiDAR、目标框、相机图像、自车未来轨迹、对象未来轨迹 | `MessageBuilder` |
 | `glb_encoder.py` | 底层 GLB 二进制编码器，管理 bufferViews、accessors、images 和 BIN chunk | `GLBEncoder` |
 | `coord_utils.py` | 坐标变换工具：点云从传感器坐标系变换到世界坐标系、四元数格式转换 | `transform_points_to_world`, `quat_to_wxyz` |
 | `visualize_map.py` | 从 `metadata.glb` 读取矢量地图并渲染为 PNG，叠加自车轨迹 | `visualize_scene_map` |
+| `tests/visualize_nusviz_basemap_alignment.py` | 从原始 basemap 裁剪场景栅格图并叠加 NUSVIZ 矢量地图，用于验证裁剪和坐标对齐 | `plot_alignment` |
 
 ### 数据流图
 
@@ -1346,13 +1507,15 @@ NuScenes SDK + NuScenesMap
     ├──────────────────────────────────────────────────────
     │  MetadataBuilder.build()                （每场景执行一次）
     │    ├── _build_cameras()  → 相机内外参 JSON
-    │    ├── _build_map()      → 矢量地图 accessor  ← 地图集成
+    │    ├── _build_map()      → 矢量地图 accessor + 栅格底图 image  ← 地图集成
     │    │     ├── 收集 ego_pose 轨迹点
     │    │     ├── Shapely buffer(75m) → 缓冲多边形
     │    │     ├── NuScenesMap.get_records_in_patch()  粗筛
     │    │     ├── buffer_poly.intersects()            精筛
     │    │     ├── buffer_poly.intersection()          裁剪
-    │    │     └── GLBEncoder.add_accessor() ×2/图层  → BIN chunk
+    │    │     ├── GLBEncoder.add_accessor() ×2/图层  → BIN chunk
+    │    │     ├── _build_basemap() → 裁剪 maps/basemap/<mapId>.png
+    │    │     └── GLBEncoder.add_image() → metadata.glb images/BIN chunk
     │    └── GLBEncoder.encode() → metadata.glb
     │
     └──────────────────────────────────────────────────────

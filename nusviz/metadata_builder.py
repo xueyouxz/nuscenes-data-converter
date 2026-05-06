@@ -4,16 +4,21 @@ Metadata 构建器
 生成 metadata.glb 文件（nuviz/metadata 消息）。
 """
 
-from typing import Dict, Any, List, Optional
+from io import BytesIO
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
 from nuscenes.nuscenes import NuScenes
 from nuscenes.map_expansion.map_api import NuScenesMap
+from PIL import Image
 from pyquaternion import Quaternion
 from shapely.geometry import LineString
 from shapely.geometry import CAP_STYLE, JOIN_STYLE
 
 from glb_encoder import GLBEncoder
 from coord_utils import quat_to_wxyz
+
+Image.MAX_IMAGE_PIXELS = 400000 * 400000
 
 
 CAMERA_CHANNELS = [
@@ -113,6 +118,11 @@ class MetadataBuilder:
         streams["/map"] = {
             "category":  "PRIMITIVE",
             "type":      "map_geometry",
+            "coordinate": "world",
+        }
+        streams["/map/basemap"] = {
+            "category":   "PRIMITIVE",
+            "type":       "raster_map",
             "coordinate": "world",
         }
         # 新增轨迹流声明
@@ -243,7 +253,8 @@ class MetadataBuilder:
         # ③ 实例化 NuScenesMap
         scene   = self.scene
         log_rec = self.nusc.get('log', scene['log_token'])
-        nusc_map = NuScenesMap(dataroot=self.dataroot, map_name=log_rec['location'])
+        location = log_rec['location']
+        nusc_map = NuScenesMap(dataroot=self.dataroot, map_name=location)
 
         # ④ 逐图层粗筛 + 精筛 + 顶点提取
         map_layers_json: Dict[str, Any] = {}
@@ -344,7 +355,134 @@ class MetadataBuilder:
                 "counts":   f"#/accessors/{c_acc}",
             }
 
-        return {
+        map_json = {
             "buffer_radius_m": BUFFER_RADIUS_M,
             "layers":          map_layers_json,
         }
+
+        basemap_json = self._build_basemap(encoder, nusc_map, location, buffer_poly.bounds)
+        if basemap_json is not None:
+            map_json["basemap"] = basemap_json
+
+        return map_json
+
+    def _build_basemap(
+        self,
+        encoder: GLBEncoder,
+        nusc_map: NuScenesMap,
+        location: str,
+        world_bounds: Tuple[float, float, float, float],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        从 nuScenes 原始 basemap.png 裁剪场景栅格底图，并写入 GLB images。
+
+        world_bounds 为世界坐标系下的 (min_x, min_y, max_x, max_y)，与
+        矢量地图使用同一个轨迹 buffer 范围，保证栅格图和矢量图对齐。
+        """
+        basemap_path = Path(self.dataroot) / "maps" / "basemap" / f"{location}.png"
+        if not basemap_path.exists():
+            return None
+
+        source = Image.open(basemap_path).convert("RGB")
+        pixel_box, actual_bounds = self._world_bounds_to_pixel_box(
+            world_bounds,
+            source.size,
+            nusc_map.canvas_edge,
+        )
+        cropped = source.crop(pixel_box)
+
+        buffer = BytesIO()
+        cropped.save(buffer, format="PNG")
+        image_idx = encoder.add_image(
+            buffer.getvalue(),
+            "image/png",
+            cropped.width,
+            cropped.height,
+        )
+
+        min_x, min_y, max_x, max_y = actual_bounds
+        meters_per_pixel_x = (max_x - min_x) / cropped.width
+        meters_per_pixel_y = (max_y - min_y) / cropped.height
+
+        return {
+            "image": f"#/images/{image_idx}",
+            "mimeType": "image/png",
+            "width": cropped.width,
+            "height": cropped.height,
+            "bounds": {
+                "min_x": min_x,
+                "min_y": min_y,
+                "max_x": max_x,
+                "max_y": max_y,
+            },
+            "resolution": {
+                "meters_per_pixel_x": meters_per_pixel_x,
+                "meters_per_pixel_y": meters_per_pixel_y,
+            },
+            "transform": {
+                "origin_x": min_x,
+                "origin_y": max_y,
+                "y_axis_direction": "down",
+            },
+            "source": {
+                "mapId": location,
+                "layer": "basemap",
+                "path": f"maps/basemap/{location}.png",
+                "canvas_edge_m": [
+                    0.0,
+                    0.0,
+                    float(nusc_map.canvas_edge[0]),
+                    float(nusc_map.canvas_edge[1]),
+                ],
+                "pixel_box": list(pixel_box),
+            },
+        }
+
+    def _world_bounds_to_pixel_box(
+        self,
+        bounds: Tuple[float, float, float, float],
+        image_size: Tuple[int, int],
+        canvas_edge: Tuple[float, float],
+    ) -> Tuple[Tuple[int, int, int, int], Tuple[float, float, float, float]]:
+        """
+        将地图世界坐标范围转换为 basemap.png 的像素裁剪框。
+
+        nuScenes basemap 图片覆盖 [0, canvas_width] x [0, canvas_height]，
+        图片坐标原点在左上角，世界坐标 y 轴向上，因此 y 方向需要翻转。
+        """
+        min_x, min_y, max_x, max_y = bounds
+        image_w, image_h = image_size
+        canvas_w, canvas_h = float(canvas_edge[0]), float(canvas_edge[1])
+
+        left = int(np.floor(min_x / canvas_w * image_w))
+        right = int(np.ceil(max_x / canvas_w * image_w))
+        top = int(np.floor((canvas_h - max_y) / canvas_h * image_h))
+        bottom = int(np.ceil((canvas_h - min_y) / canvas_h * image_h))
+
+        left = max(0, min(image_w, left))
+        right = max(0, min(image_w, right))
+        top = max(0, min(image_h, top))
+        bottom = max(0, min(image_h, bottom))
+
+        if left >= right or top >= bottom:
+            raise ValueError(
+                "Basemap crop is empty after clamping: "
+                f"bounds={bounds}, pixel_box={(left, top, right, bottom)}"
+            )
+
+        actual_min_x = left / image_w * canvas_w
+        actual_max_x = right / image_w * canvas_w
+        actual_max_y = canvas_h - top / image_h * canvas_h
+        actual_min_y = canvas_h - bottom / image_h * canvas_h
+
+        return (
+            left,
+            top,
+            right,
+            bottom,
+        ), (
+            float(actual_min_x),
+            float(actual_min_y),
+            float(actual_max_x),
+            float(actual_max_y),
+        )
