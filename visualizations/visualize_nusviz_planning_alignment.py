@@ -4,8 +4,8 @@ Visualize NUSVIZ GT ego trajectory and SparseDrive planning trajectories.
 
 The script reads an already converted NUSVIZ scene directory and overlays:
 - the real ego trajectory from /ego_pose in every keyframe message
-- the GT future trajectory stream /ego/fut_trajectory when present
-- the SparseDrive final_planning stream /ego/planning_trajectory for sampled keyframes
+- the GT future trajectory stream /gt/ego/future_trajectory when present
+- the SparseDrive final_planning stream /pred/sparsedrive/planning for sampled keyframes
 
 Example:
     python visualizations/visualize_nusviz_planning_alignment.py \
@@ -24,8 +24,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-PLANNING_STREAM = "/ego/planning_trajectory"
-EGO_FUT_STREAM = "/ego/fut_trajectory"
+PLANNING_STREAM = "/pred/sparsedrive/planning"
+EGO_FUT_STREAM = "/gt/ego/future_trajectory"
 
 
 def parse_glb(path: Path) -> Tuple[Dict[str, Any], bytes]:
@@ -86,12 +86,19 @@ def extract_trajectory(
     if primitive is None:
         return None
 
-    trajectory = primitive.get("trajectory", [])
-    if not trajectory:
-        return None
+    if "vertices" in primitive:
+        vertices = read_accessor(json_data, bin_data, primitive["vertices"])
+        offsets = read_accessor(json_data, bin_data, primitive["offsets"])
+        if len(offsets) < 2:
+            return None
+        return vertices[int(offsets[0]) : int(offsets[1]), :2]
 
-    poses = read_accessor(json_data, bin_data, trajectory[0]["poses"])
-    return poses[:, :2]
+    # Backward-compatible read path for older local outputs.
+    trajectory = primitive.get("trajectory", [])
+    if trajectory:
+        poses = read_accessor(json_data, bin_data, trajectory[0]["poses"])
+        return poses[:, :2]
+    return None
 
 
 def load_scene(scene_dir: Path) -> Dict[str, Any]:
@@ -224,7 +231,7 @@ def visualize(scene_dir: Path, output: Optional[str], stride: int, max_frames: O
             linestyle="--",
             linewidth=1.8,
             alpha=0.7,
-            label="Frame 0 /ego/fut_trajectory",
+            label=f"Frame 0 {EGO_FUT_STREAM}",
             zorder=3,
         )
         xy_groups.append(ego_future)

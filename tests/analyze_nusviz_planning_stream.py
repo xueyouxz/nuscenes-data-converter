@@ -34,8 +34,8 @@ for path in (REPO_ROOT, NUSVIZ_ROOT):
         sys.path.insert(0, str(path))
 
 
-PLANNING_STREAM = "/ego/planning_trajectory"
-EGO_GT_STREAM = "/ego/fut_trajectory"
+PLANNING_STREAM = "/pred/sparsedrive/planning"
+EGO_GT_STREAM = "/gt/ego/future_trajectory"
 
 
 def parse_glb(path: Path) -> Tuple[Dict[str, Any], bytes]:
@@ -102,10 +102,22 @@ def extract_stream_poses(
     primitive = update.get("primitives", {}).get(stream_name)
     if primitive is None:
         return None
+
+    if "vertices" in primitive:
+        vertices = read_accessor(json_data, bin_data, primitive["vertices"])
+        offsets = read_accessor(json_data, bin_data, primitive["offsets"])
+        if int(primitive["count"]) != len(offsets) - 1:
+            raise AssertionError(
+                f"{stream_name} count mismatch: json={primitive['count']} offsets={len(offsets) - 1}"
+            )
+        if len(offsets) < 2:
+            return None
+        return vertices[int(offsets[0]) : int(offsets[1])]
+
+    # Backward-compatible read path for older local outputs.
     trajectory = primitive.get("trajectory", [])
     if len(trajectory) != 1:
         raise AssertionError(f"{stream_name} should contain exactly one trajectory")
-
     traj_meta = trajectory[0]
     poses = read_accessor(json_data, bin_data, traj_meta["poses"])
     if int(traj_meta["count"]) != len(poses):
@@ -159,10 +171,6 @@ def validate_scene(args: argparse.Namespace) -> Dict[str, Any]:
         if not args.nuscenes_dataroot:
             raise ValueError("--nuscenes-dataroot is required with --sparsedrive-pkl")
         nusc, sample_tokens = collect_sample_tokens(scene_token, args.nuscenes_dataroot, args.version)
-        if len(sample_tokens) != len(messages):
-            raise AssertionError(
-                f"message/sample count mismatch: messages={len(messages)} samples={len(sample_tokens)}"
-            )
         sd_extractor = build_sparsedrive_extractor(args.sparsedrive_pkl, nusc)
 
     frames_with_stream = 0
@@ -207,7 +215,13 @@ def validate_scene(args: argparse.Namespace) -> Dict[str, Any]:
                 frame_report["first_point_gt_error_m"] = gt_start_error
 
         if sd_extractor is not None and sample_tokens is not None:
-            sample_token = sample_tokens[idx]
+            sample_token = (
+                entry.get("extensions", {})
+                .get("nuscenes", {})
+                .get("sample_token")
+            )
+            if sample_token is None:
+                sample_token = sample_tokens[idx]
             has_source_prediction = sd_extractor.has_prediction(sample_token)
             frame_report["has_source_prediction"] = has_source_prediction
 
@@ -253,7 +267,7 @@ def validate_scene(args: argparse.Namespace) -> Dict[str, Any]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Validate SparseDrive final_planning inside NUSVIZ /ego/planning_trajectory."
+        description="Validate SparseDrive final_planning inside NUSVIZ V2 /pred/sparsedrive/planning."
     )
     parser.add_argument("--scene-dir", required=True, help="NUSVIZ scene directory")
     parser.add_argument("--sparsedrive-pkl", default=None, help="SparseDrive prediction pkl for source comparison")

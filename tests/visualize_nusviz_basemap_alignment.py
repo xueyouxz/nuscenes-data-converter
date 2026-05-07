@@ -116,22 +116,32 @@ def extract_layer_polygons(
     layer: Dict[str, str],
 ) -> List[np.ndarray]:
     vertices = read_accessor(json_data, bin_data, layer["vertices"])
-    counts = read_accessor(json_data, bin_data, layer["counts"])
+    if "offsets" in layer:
+        offsets = read_accessor(json_data, bin_data, layer["offsets"])
+    else:
+        counts = read_accessor(json_data, bin_data, layer["counts"])
+        offsets = np.concatenate([[0], np.cumsum(counts)]).astype(np.uint32)
 
     polygons = []
-    offset = 0
-    for count in counts:
-        count_int = int(count)
-        poly = vertices[offset : offset + count_int, :2]
+    for idx in range(len(offsets) - 1):
+        start = int(offsets[idx])
+        end = int(offsets[idx + 1])
+        poly = vertices[start:end, :2]
         if len(poly) >= 3:
             polygons.append(poly)
-        offset += count_int
     return polygons
 
 
 def iter_vector_polygons(json_data: Dict[str, Any], bin_data: bytes) -> Iterable[Tuple[str, np.ndarray]]:
     map_data = json_data["nuviz"]["data"].get("map", {})
-    for layer_name, layer in map_data.get("layers", {}).items():
+    layers = map_data.get("layers")
+    if not layers:
+        layers = {
+            stream_name.removeprefix("/gt/map/"): payload
+            for stream_name, payload in map_data.items()
+            if stream_name.startswith("/gt/map/") and "vertices" in payload
+        }
+    for layer_name, layer in layers.items():
         for polygon in extract_layer_polygons(json_data, bin_data, layer):
             yield layer_name, polygon
 

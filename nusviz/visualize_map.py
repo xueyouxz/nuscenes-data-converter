@@ -85,13 +85,28 @@ def read_accessor(json_data, bin_data, accessor_ref):
 def extract_polygons(json_data, bin_data, layer):
     """从一个图层的 accessor 还原多边形列表，返回 list of (N,2) ndarray。"""
     vertices = read_accessor(json_data, bin_data, layer['vertices'])  # (K, 3)
-    counts   = read_accessor(json_data, bin_data, layer['counts'])    # (P,)
+    if 'offsets' in layer:
+        offsets = read_accessor(json_data, bin_data, layer['offsets'])
+    else:
+        counts = read_accessor(json_data, bin_data, layer['counts'])
+        offsets = np.concatenate([[0], np.cumsum(counts)]).astype(np.uint32)
+
     polygons = []
-    offset = 0
-    for n in counts:
-        polygons.append(vertices[offset : offset + n, :2])  # 只取 XY
-        offset += n
+    for idx in range(len(offsets) - 1):
+        start = int(offsets[idx])
+        end = int(offsets[idx + 1])
+        polygons.append(vertices[start:end, :2])  # 只取 XY
     return polygons
+
+
+def _map_layers(map_data):
+    if map_data.get('layers'):
+        return map_data['layers']
+    return {
+        stream_name.removeprefix('/gt/map/'): payload
+        for stream_name, payload in map_data.items()
+        if stream_name.startswith('/gt/map/') and 'vertices' in payload
+    }
 
 
 # ─────────────────────────────────────────────
@@ -112,12 +127,12 @@ def visualize_scene_map(scene_dir: str, save_path: str = None):
     data     = nuviz['data']
     map_data = data.get('map')
 
-    if map_data is None or not map_data.get('layers'):
+    layers = _map_layers(map_data or {})
+    if not layers:
         print("ERROR: No map data found in metadata.glb")
         sys.exit(1)
 
     location = data['extensions']['nuscenes']['scene']['location']
-    layers   = map_data['layers']
     radius   = map_data.get('buffer_radius_m', 75)
 
     # ── 读取自车轨迹（从 message_index.json + 各帧 ego_pose）──

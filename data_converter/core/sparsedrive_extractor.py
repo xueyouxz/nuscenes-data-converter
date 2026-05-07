@@ -173,6 +173,7 @@ class SparseDriveExtractor:
         
         # 批量转换坐标
         translations_local = boxes_3d[:, :2]
+        z_global = boxes_3d[:, 2] + float(ego_translation[2])
         yaws_local = boxes_3d[:, 6]
         sizes = boxes_3d[:, 3:6]
         velocities = boxes_3d[:, 7:9]
@@ -202,7 +203,11 @@ class SparseDriveExtractor:
                 'category': CLASSES[labels_3d[i]],
                 'score': float(scores_3d[i]),
                 'instance_id': int(instance_ids[i]),
-                'translation': translations_global[i].tolist(),
+                'translation': [
+                    float(translations_global[i][0]),
+                    float(translations_global[i][1]),
+                    float(z_global[i]),
+                ],
                 'yaw': float(yaws_global[i]),
                 'size': sizes[i].tolist(),
                 'velocity': velocities[i].tolist(),
@@ -344,4 +349,3 @@ class SparseDriveExtractor:
             })
         
         return map_predictions
-

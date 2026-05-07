@@ -6,6 +6,7 @@ Metadata 构建器
 
 from io import BytesIO
 from pathlib import Path
+from collections import defaultdict
 from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
 from nuscenes.nuscenes import NuScenes
@@ -15,8 +16,12 @@ from pyquaternion import Quaternion
 from shapely.geometry import LineString
 from shapely.geometry import CAP_STYLE, JOIN_STYLE
 
-from glb_encoder import GLBEncoder
-from coord_utils import quat_to_wxyz
+try:
+    from .glb_encoder import GLBEncoder
+    from .coord_utils import quat_to_wxyz
+except ImportError:
+    from glb_encoder import GLBEncoder
+    from coord_utils import quat_to_wxyz
 
 Image.MAX_IMAGE_PIXELS = 400000 * 400000
 
@@ -78,11 +83,18 @@ BUFFER_RADIUS_M = 75.0
 class MetadataBuilder:
     """从 NuScenes 场景构建 nuviz/metadata GLB 文件。"""
 
-    def __init__(self, nusc: NuScenes, scene_token: str, dataroot: Optional[str] = None):
+    def __init__(
+        self,
+        nusc: NuScenes,
+        scene_token: str,
+        dataroot: Optional[str] = None,
+        sample_tokens: Optional[List[str]] = None,
+    ):
         self.nusc = nusc
         self.scene = nusc.get('scene', scene_token)
         # dataroot 用于实例化 NuScenesMap；若未传入则从 nusc 对象获取
         self.dataroot = dataroot or nusc.dataroot
+        self.sample_tokens = sample_tokens
 
     def build(self) -> bytes:
         """构建并返回 metadata.glb 的字节内容。"""
@@ -90,23 +102,59 @@ class MetadataBuilder:
         log_rec = self.nusc.get('log', scene['log_token'])
         location = log_rec['location']
 
-        first_sample = self.nusc.get('sample', scene['first_sample_token'])
-        last_sample  = self.nusc.get('sample', scene['last_sample_token'])
+        sample_tokens = self._get_sample_tokens()
+        first_sample = self.nusc.get('sample', sample_tokens[0])
+        last_sample  = self.nusc.get('sample', sample_tokens[-1])
         start_time = first_sample['timestamp'] / 1e6
         end_time   = last_sample['timestamp']  / 1e6
 
         encoder = GLBEncoder()
 
-        cameras = self._build_cameras(scene['first_sample_token'])
+        cameras = self._build_cameras(sample_tokens[0])
 
-        # 构建地图数据（写入 BIN chunk）
         map_json = self._build_map(encoder)
+        statistics = self._build_statistics(encoder, sample_tokens, start_time)
 
-        # 固定 streams，相机 streams 动态追加
         streams = {
-            "/ego_pose":       {"category": "POSE",      "coordinate": "world"},
-            "/lidar":          {"category": "PRIMITIVE", "type": "point",           "coordinate": "world"},
-            "/objects/bounds": {"category": "PRIMITIVE", "type": "nuscenes_cuboid", "coordinate": "world"},
+            "/ego_pose": {"category": "POSE", "type": "pose", "coordinate": "world"},
+            "/lidar": {"category": "PRIMITIVE", "type": "point", "coordinate": "world"},
+            "/map/basemap": {"category": "PRIMITIVE", "type": "image", "coordinate": "world"},
+            "/gt/objects/bounds": {"category": "PRIMITIVE", "type": "cuboid", "coordinate": "world"},
+            "/gt/objects/future_trajectories": {
+                "category": "PRIMITIVE",
+                "type": "polyline",
+                "coordinate": "world",
+            },
+            "/gt/ego/future_trajectory": {
+                "category": "PRIMITIVE",
+                "type": "polyline",
+                "coordinate": "world",
+            },
+            "/pred/sparsedrive/planning": {
+                "category": "PRIMITIVE",
+                "type": "polyline",
+                "coordinate": "world",
+            },
+            "/pred/sparsedrive/objects/bounds": {
+                "category": "PRIMITIVE",
+                "type": "cuboid",
+                "coordinate": "world",
+            },
+            "/pred/sparsedrive/map/divider": {
+                "category": "PRIMITIVE",
+                "type": "polyline",
+                "coordinate": "world",
+            },
+            "/pred/sparsedrive/map/boundary": {
+                "category": "PRIMITIVE",
+                "type": "polyline",
+                "coordinate": "world",
+            },
+            "/pred/sparsedrive/map/ped_crossing": {
+                "category": "PRIMITIVE",
+                "type": "polyline",
+                "coordinate": "world",
+            },
         }
         for channel in cameras:
             streams[f"/camera/{channel}"] = {
@@ -114,33 +162,12 @@ class MetadataBuilder:
                 "type": "image",
                 "coordinate": "ego",
             }
-        # 新增 /map 通道声明
-        streams["/map"] = {
-            "category":  "PRIMITIVE",
-            "type":      "map_geometry",
-            "coordinate": "world",
-        }
-        streams["/map/basemap"] = {
-            "category":   "PRIMITIVE",
-            "type":       "raster_map",
-            "coordinate": "world",
-        }
-        # 新增轨迹流声明
-        streams["/ego/fut_trajectory"] = {
-            "category":   "PRIMITIVE",
-            "type":        "ego_trajectory",
-            "coordinate": "world",
-        }
-        streams["/ego/planning_trajectory"] = {
-            "category":   "PRIMITIVE",
-            "type":        "planning_trajectory",
-            "coordinate": "world",
-        }
-        streams["/objects/fut_trajectories"] = {
-            "category":   "PRIMITIVE",
-            "type":        "object_trajectories",
-            "coordinate": "world",
-        }
+        for layer_name in MAP_LAYERS:
+            streams[f"/gt/map/{layer_name}"] = {
+                "category": "PRIMITIVE",
+                "type": "polygon",
+                "coordinate": "world",
+            }
 
         metadata = {
             "type": "nuviz/metadata",
@@ -152,6 +179,7 @@ class MetadataBuilder:
                 "streams":    streams,
                 "cameras":    cameras,
                 "map":        map_json,
+                "statistics": statistics,
                 "extensions": {
                     "nuscenes": {
                         "scene": {
@@ -180,6 +208,19 @@ class MetadataBuilder:
         }
 
         return encoder.encode(metadata)
+
+    def _get_sample_tokens(self) -> List[str]:
+        if self.sample_tokens:
+            return self.sample_tokens
+
+        tokens: List[str] = []
+        sample_token = self.scene['first_sample_token']
+        while sample_token:
+            tokens.append(sample_token)
+            sample_token = self.nusc.get('sample', sample_token)['next']
+        if not tokens:
+            raise ValueError(f"Scene has no samples: {self.scene['token']}")
+        return tokens
 
     def _build_cameras(self, sample_token: str) -> Dict[str, Any]:
         """读取第一帧各相机的内外参，返回相机信息字典。"""
@@ -212,18 +253,154 @@ class MetadataBuilder:
         Returns:
             trajectory_xy: list of [x, y]，世界坐标系，单位米
         """
-        scene = self.scene
+        sample_tokens = self._get_sample_tokens()
         trajectory_xy = []
 
-        sample_token = scene['first_sample_token']
-        while sample_token:
+        for sample_token in sample_tokens:
             sample   = self.nusc.get('sample', sample_token)
             lidar_sd = self.nusc.get('sample_data', sample['data']['LIDAR_TOP'])
             ep       = self.nusc.get('ego_pose', lidar_sd['ego_pose_token'])
             trajectory_xy.append(ep['translation'][:2])
-            sample_token = sample['next']  # 空字符串时循环终止
 
         return trajectory_xy
+
+    def _build_statistics(
+        self,
+        encoder: GLBEncoder,
+        sample_tokens: List[str],
+        start_time: float,
+    ) -> Dict[str, Any]:
+        """构建与 message_index.messages 对齐的帧统计。"""
+        timestamps: List[float] = []
+        positions: List[List[float]] = []
+
+        for sample_token in sample_tokens:
+            sample = self.nusc.get('sample', sample_token)
+            lidar_sd = self.nusc.get('sample_data', sample['data']['LIDAR_TOP'])
+            ep = self.nusc.get('ego_pose', lidar_sd['ego_pose_token'])
+            timestamps.append(sample['timestamp'] / 1e6)
+            positions.append(list(ep['translation']))
+
+        timeline = np.array([ts - start_time for ts in timestamps], dtype=np.float32)
+        positions_arr = np.array(positions, dtype=np.float32)
+        speed = np.zeros(len(sample_tokens), dtype=np.float32)
+        acceleration = np.zeros(len(sample_tokens), dtype=np.float32)
+
+        if len(sample_tokens) > 1:
+            dt = np.diff(np.array(timestamps, dtype=np.float64))
+            distances = np.linalg.norm(np.diff(positions_arr[:, :2], axis=0), axis=1)
+            interval_speed = np.divide(
+                distances,
+                dt,
+                out=np.zeros_like(distances, dtype=np.float64),
+                where=dt > 0,
+            )
+            speed[0] = interval_speed[0]
+            speed[1:] = interval_speed.astype(np.float32)
+            interval_accel = np.diff(speed) / np.maximum(dt, 1e-6)
+            acceleration[1:] = interval_accel.astype(np.float32)
+
+        timeline_acc = encoder.add_accessor(timeline, type_str="SCALAR")
+        speed_acc = encoder.add_accessor(speed, type_str="SCALAR")
+        acceleration_acc = encoder.add_accessor(acceleration, type_str="SCALAR")
+
+        statistics: Dict[str, Any] = {
+            "frame_count": len(sample_tokens),
+            "timeline": {
+                "values": f"#/accessors/{timeline_acc}",
+                "unit": "second",
+                "reference": "log_info.start_time",
+            },
+            "ego_state": {
+                "speed": {
+                    "values": f"#/accessors/{speed_acc}",
+                    "unit": "meter_per_second",
+                },
+                "acceleration": {
+                    "values": f"#/accessors/{acceleration_acc}",
+                    "unit": "meter_per_second_squared",
+                },
+            },
+            "object_counts": {},
+        }
+
+        gt_counts = self._build_gt_object_count_statistics(encoder, sample_tokens)
+        if gt_counts:
+            statistics["object_counts"]["/gt/objects/bounds"] = gt_counts
+        return statistics
+
+    def _build_gt_object_count_statistics(
+        self,
+        encoder: GLBEncoder,
+        sample_tokens: List[str],
+    ) -> Dict[str, Any]:
+        total_frames: List[int] = []
+        total_values: List[int] = []
+        category_frames: Dict[str, List[int]] = defaultdict(list)
+        category_values: Dict[str, List[int]] = defaultdict(list)
+
+        for frame_idx, sample_token in enumerate(sample_tokens):
+            sample = self.nusc.get('sample', sample_token)
+            if sample['anns']:
+                total_frames.append(frame_idx)
+                total_values.append(len(sample['anns']))
+
+            counts: Dict[str, int] = defaultdict(int)
+            for ann_token in sample['anns']:
+                ann = self.nusc.get('sample_annotation', ann_token)
+                category = self._resolve_gt_category(ann['category_name'])
+                counts[category] += 1
+
+            for category, count in counts.items():
+                category_frames[category].append(frame_idx)
+                category_values[category].append(count)
+
+        if not total_frames:
+            return {}
+
+        total_frame_acc = encoder.add_accessor(np.array(total_frames, dtype=np.uint32), type_str="SCALAR")
+        total_value_acc = encoder.add_accessor(np.array(total_values, dtype=np.uint32), type_str="SCALAR")
+
+        payload: Dict[str, Any] = {
+            "unit": "count",
+            "total": {
+                "frame_indices": f"#/accessors/{total_frame_acc}",
+                "values": f"#/accessors/{total_value_acc}",
+            },
+            "categories": {},
+        }
+
+        for category in sorted(category_frames):
+            frame_acc = encoder.add_accessor(np.array(category_frames[category], dtype=np.uint32), type_str="SCALAR")
+            value_acc = encoder.add_accessor(np.array(category_values[category], dtype=np.uint32), type_str="SCALAR")
+            payload["categories"][category] = {
+                "frame_indices": f"#/accessors/{frame_acc}",
+                "values": f"#/accessors/{value_acc}",
+            }
+        return payload
+
+    def _resolve_gt_category(self, category_name: str) -> str:
+        if "vehicle.car" in category_name:
+            return "car"
+        if "vehicle.truck" in category_name:
+            return "truck"
+        if "vehicle.bus" in category_name:
+            return "bus"
+        if "vehicle.trailer" in category_name:
+            return "trailer"
+        if "vehicle.construction" in category_name:
+            return "construction_vehicle"
+        if "vehicle.motorcycle" in category_name:
+            return "motorcycle"
+        if "vehicle.bicycle" in category_name:
+            return "bicycle"
+        if "pedestrian" in category_name:
+            return "pedestrian"
+        if "barrier" in category_name:
+            return "barrier"
+        if "traffic_cone" in category_name:
+            return "traffic_cone"
+        return category_name.split('.')[0]
 
     def _build_map(self, encoder: GLBEncoder) -> Dict[str, Any]:
         """
@@ -234,18 +411,24 @@ class MetadataBuilder:
             encoder: GLBEncoder 实例，地图顶点/计数数据将追加至其 BIN chunk
 
         Returns:
-            map_json: {"buffer_radius_m": ..., "layers": {layer_name: {"vertices": ..., "counts": ...}, ...}}
+            map_json: {"/gt/map/<layer>": {"vertices": ..., "offsets": ..., "count": ...}, ...}
         """
         # ① 收集轨迹
         trajectory_xy = self._collect_trajectory()
 
         # ② 构建缓冲多边形（Shapely 1.x API）
-        line        = LineString(trajectory_xy)
-        buffer_poly = line.buffer(
-            BUFFER_RADIUS_M,
-            cap_style=CAP_STYLE.round,
-            join_style=JOIN_STYLE.round,
-        )
+        if len(trajectory_xy) >= 2:
+            line_or_point = LineString(trajectory_xy)
+            buffer_poly = line_or_point.buffer(
+                BUFFER_RADIUS_M,
+                cap_style=CAP_STYLE.round,
+                join_style=JOIN_STYLE.round,
+            )
+        else:
+            from shapely.geometry import Point
+
+            line_or_point = Point(trajectory_xy[0])
+            buffer_poly = line_or_point.buffer(BUFFER_RADIUS_M)
         # patch_box: (xmin, ymin, xmax, ymax)，用于 API 粗筛
         xmin, ymin, xmax, ymax = buffer_poly.bounds
         patch_box = (xmin, ymin, xmax, ymax)
@@ -345,24 +528,25 @@ class MetadataBuilder:
                 continue
 
             v_arr = np.array(all_vertices, dtype=np.float32)  # (K, 3)
-            c_arr = np.array(all_counts,   dtype=np.uint32)   # (P,)
+            offsets = [0]
+            for count in all_counts:
+                offsets.append(offsets[-1] + count)
+            o_arr = np.array(offsets, dtype=np.uint32)
 
             v_acc = encoder.add_accessor(v_arr, type_str="VEC3")
-            c_acc = encoder.add_accessor(c_arr, type_str="SCALAR")
+            o_acc = encoder.add_accessor(o_arr, type_str="SCALAR")
 
-            map_layers_json[layer_name] = {
+            map_layers_json[f"/gt/map/{layer_name}"] = {
                 "vertices": f"#/accessors/{v_acc}",
-                "counts":   f"#/accessors/{c_acc}",
+                "offsets": f"#/accessors/{o_acc}",
+                "count": len(all_counts),
             }
 
-        map_json = {
-            "buffer_radius_m": BUFFER_RADIUS_M,
-            "layers":          map_layers_json,
-        }
+        map_json = map_layers_json
 
         basemap_json = self._build_basemap(encoder, nusc_map, location, buffer_poly.bounds)
         if basemap_json is not None:
-            map_json["basemap"] = basemap_json
+            map_json["/map/basemap"] = basemap_json
 
         return map_json
 

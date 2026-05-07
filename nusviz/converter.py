@@ -14,8 +14,12 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from metadata_builder import MetadataBuilder
-from message_builder import MessageBuilder
+try:
+    from .metadata_builder import MetadataBuilder
+    from .message_builder import MessageBuilder
+except ImportError:
+    from metadata_builder import MetadataBuilder
+    from message_builder import MessageBuilder
 
 
 # ===== 硬编码配置 =====
@@ -126,40 +130,54 @@ class NuScenesConverter:
 
         scene_dir    = self.output_root / scene_name
         messages_dir = scene_dir / "messages"
+
+        all_samples = self._collect_samples(scene_token)
+        sample_to_original_idx = {token: idx for idx, token in enumerate(all_samples)}
+        samples = self._select_convertible_samples(all_samples)
+        if not samples:
+            print(f"Skipping {scene_name}: no keyframes with SparseDrive predictions")
+            return None
+
         messages_dir.mkdir(parents=True, exist_ok=True)
+        for stale_message in messages_dir.glob("*.glb"):
+            stale_message.unlink()
 
         # 1. metadata.glb
         (scene_dir / "metadata.glb").write_bytes(
-            MetadataBuilder(self.nusc, scene_token).build()
+            MetadataBuilder(
+                self.nusc,
+                scene_token,
+                dataroot=self.dataroot,
+                sample_tokens=samples,
+            ).build()
         )
 
-        # 2. 预计算全场景轨迹数据
-        samples  = self._collect_samples(scene_token)
-        ego_all  = self._collect_ego_poses(samples)         # list of [x,y,z], len=N
-        obj_all  = self._collect_obj_trajectories(samples)  # track_id -> [(frame_idx,[x,y,z]),...]
+        # 2. 预计算全场景轨迹数据。消息只写有预测的关键帧，但 GT future
+        #    仍使用原始 scene 时间线，保证末尾预测帧能看到后续真实轨迹。
+        ego_all  = self._collect_ego_poses(all_samples)         # list of [x,y,z], len=N
+        obj_all  = self._collect_obj_trajectories(all_samples)  # track_id -> [(frame_idx,[x,y,z]),...]
 
         # 3. messages/*.glb
         message_builder = MessageBuilder(self.nusc, self.dataroot)
         message_entries = []
-        planning_source_count = 0
-        planning_written_count = 0
+        prediction_frame_count = 0
 
         for idx, sample_token in enumerate(samples):
             sample    = self.nusc.get('sample', sample_token)
             timestamp = sample['timestamp'] / 1e6
+            original_idx = sample_to_original_idx[sample_token]
 
             # 自车未来轨迹：从当前帧（含）到末帧
-            ego_future = ego_all[idx:]
+            ego_future = ego_all[original_idx:]
 
             # 对象未来轨迹：与当前帧 anns 顺序严格对应
-            obj_future = self._get_obj_future_for_frame(sample, idx, obj_all)
+            obj_future = self._get_obj_future_for_frame(sample, original_idx, obj_all)
 
-            # SparseDrive final_planning：缺预测时不写该 primitive
             planning_trajectory = self._get_planning_trajectory(sample_token)
-            if self.sd_extractor is not None and self.sd_extractor.has_prediction(sample_token):
-                planning_source_count += 1
-            if planning_trajectory is not None:
-                planning_written_count += 1
+            sparsedrive_detections = self._get_sparsedrive_detections(sample_token)
+            sparsedrive_map_predictions = self._get_sparsedrive_map_predictions(sample_token)
+            if self.sd_extractor is not None:
+                prediction_frame_count += 1
 
             update_type = "COMPLETE_STATE" if idx == 0 else "INCREMENTAL"
             msg_bytes   = message_builder.build_message(
@@ -171,6 +189,8 @@ class NuScenesConverter:
                 ego_future_poses=ego_future,
                 planning_trajectory=planning_trajectory,
                 obj_future_trajectories=obj_future,
+                sparsedrive_detections=sparsedrive_detections,
+                sparsedrive_map_predictions=sparsedrive_map_predictions,
             )
 
             filename = f"{idx:06d}.glb"
@@ -179,6 +199,12 @@ class NuScenesConverter:
                 "index":     idx,
                 "timestamp": timestamp,
                 "file":      f"messages/{filename}",
+                "extensions": {
+                    "nuscenes": {
+                        "sample_token": sample_token,
+                        "original_sample_index": original_idx,
+                    }
+                },
             })
 
         # 4. message_index.json
@@ -208,8 +234,8 @@ class NuScenesConverter:
 
         if self.sd_extractor is not None:
             print(
-                f"SparseDrive planning written for {planning_written_count}/"
-                f"{planning_source_count} frames with source predictions in {scene_name}"
+                f"Converted {prediction_frame_count}/{len(all_samples)} keyframes "
+                f"with SparseDrive predictions in {scene_name}"
             )
 
     # ------------------------------------------------------------------
@@ -225,6 +251,22 @@ class NuScenesConverter:
             tokens.append(token)
             token = self.nusc.get('sample', token)['next']
         return tokens
+
+    def _select_convertible_samples(self, sample_tokens: List[str]) -> List[str]:
+        """
+        V2 预测协议只写包含模型预测结果的关键帧。
+
+        没有配置 SparseDrive 预测文件时保留所有 sample，便于调试纯 GT 输出；
+        配置了预测文件时严格按 sample_token 过滤，场景尾部缺预测的帧不会生成
+        message 文件。
+        """
+        if self.sd_extractor is None:
+            return sample_tokens
+        return [
+            sample_token
+            for sample_token in sample_tokens
+            if self.sd_extractor.has_prediction(sample_token)
+        ]
 
     def _get_planning_trajectory(self, sample_token: str) -> Optional[List[List[float]]]:
         """
@@ -243,6 +285,20 @@ class NuScenesConverter:
             return None
 
         return [[point[0], point[1], 0.0] for point in planning_xy]
+
+    def _get_sparsedrive_detections(self, sample_token: str) -> Optional[List[Dict[str, object]]]:
+        if self.sd_extractor is None:
+            return None
+        if not self.sd_extractor.has_prediction(sample_token):
+            return None
+        return self.sd_extractor.extract_detections(sample_token)
+
+    def _get_sparsedrive_map_predictions(self, sample_token: str) -> Optional[List[Dict[str, object]]]:
+        if self.sd_extractor is None:
+            return None
+        if not self.sd_extractor.has_prediction(sample_token):
+            return None
+        return self.sd_extractor.extract_map_predictions(sample_token)
 
     def _collect_ego_poses(self, sample_tokens: List[str]) -> List[List[float]]:
         """
