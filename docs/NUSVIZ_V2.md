@@ -666,6 +666,7 @@ GT 框可以省略 `SCORE`。预测框可以省略 `TRACK_ID`。
 ```
 
 `count` 与当前帧 `/gt/objects/bounds.count` 一致。第 `i` 条轨迹对应第 `i` 个 GT cuboid。
+轨迹顶点的 `x/y` 使用对象中心，`z` 使用对象底面高度，即 `sample_annotation.translation[2] - sample_annotation.size[2] / 2`。
 
 ### 9.5 `/gt/ego/future_trajectory`
 

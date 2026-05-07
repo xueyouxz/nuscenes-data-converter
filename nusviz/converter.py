@@ -322,6 +322,8 @@ class NuScenesConverter:
         扫描场景所有帧，构建 track_id -> [(frame_idx, [x,y,z]), ...] 映射。
 
         用于后续按帧、按 track_id 快速查询对象的未来轨迹点。
+        对象未来轨迹的 z 使用 box 底面高度，而非 annotation center 高度；
+        /gt/objects/bounds.CENTER 仍保持 nuScenes 原始中心点语义。
         每条记录按 frame_idx 升序排列（遍历顺序保证有序）。
         """
         traj: Dict[int, List[Tuple[int, List[float]]]] = defaultdict(list)
@@ -331,9 +333,15 @@ class NuScenesConverter:
             for ann_token in sample['anns']:
                 ann      = self.nusc.get('sample_annotation', ann_token)
                 track_id = self.nusc.getind('instance', ann['instance_token'])
-                traj[track_id].append((frame_idx, list(ann['translation'])))
+                traj[track_id].append((frame_idx, self._annotation_bottom_center(ann)))
 
         return traj
+
+    def _annotation_bottom_center(self, ann: Dict[str, object]) -> List[float]:
+        """返回 annotation box 底面中心点 [x, y, bottom_z]。"""
+        center = ann['translation']
+        height = ann['size'][2]
+        return [center[0], center[1], center[2] - height / 2.0]
 
     def _get_obj_future_for_frame(
         self,
@@ -351,7 +359,7 @@ class NuScenesConverter:
 
         Returns:
             list of list of [x,y,z]，长度 = len(sample['anns'])；
-            第 i 项为第 i 个标注对象从当前帧（含）往后所有出现帧的中心点序列。
+            第 i 项为第 i 个标注对象从当前帧（含）往后所有出现帧的底面中心点序列。
             若某对象在当前帧之后不再出现，则对应项为单元素列表（仅含当前帧位置）。
         """
         result: List[List[List[float]]] = []

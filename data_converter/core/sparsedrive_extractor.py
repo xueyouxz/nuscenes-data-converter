@@ -8,7 +8,7 @@ SparseDrive预测提取器
 import pickle
 import numpy as np
 import torch
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 from pathlib import Path
 
 from ..utils.coord_transform import (
@@ -248,7 +248,7 @@ class SparseDriveExtractor:
         self,
         sample_token: str,
         centers_local: np.ndarray,
-    ) -> tuple[np.ndarray, float]:
+    ) -> Tuple[np.ndarray, float]:
         """将 SparseDrive 检测框中心从其输出坐标系转换到 ego 坐标系。"""
         if self.detection_box_frame == "ego":
             return centers_local.astype(np.float32), 0.0
