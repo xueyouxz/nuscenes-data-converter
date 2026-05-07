@@ -48,16 +48,28 @@ class SparseDriveExtractor:
     提取模型预测的检测框、轨迹、地图元素和规划结果
     """
     
-    def __init__(self, prediction_file: str, nuscenes_extractor):
+    def __init__(
+        self,
+        prediction_file: str,
+        nuscenes_extractor,
+        detection_box_frame: str = "lidar",
+    ):
         """
         初始化提取器
         
         Args:
             prediction_file: 预测结果pkl文件路径
             nuscenes_extractor: NuScenesExtractor实例，用于获取ego_pose
+            detection_box_frame: boxes_3d 中检测框中心所在坐标系。
+                SparseDrive/mmdet3d 的 3D detection box 通常在 LIDAR_TOP 坐标系；
+                若输入 pkl 已后处理到 ego 坐标系，可传 "ego"。
         """
+        if detection_box_frame not in {"lidar", "ego"}:
+            raise ValueError(f"Unsupported detection_box_frame: {detection_box_frame}")
+
         self.prediction_file = prediction_file
         self.nuscenes_extractor = nuscenes_extractor
+        self.detection_box_frame = detection_box_frame
         self.predictions = self._load_predictions()
         self.sample_token_to_prediction = self._build_index()
     
@@ -130,12 +142,16 @@ class SparseDriveExtractor:
             score_threshold: 置信度阈值，None表示使用配置的默认值
             
         Returns:
-            检测框列表，每个包含category, translation, yaw, size, velocity, trajectories等
+            检测框列表，每个包含 category, translation, yaw, size, velocity,
+            trajectories 等。其中 translation 与 nuScenes
+            sample_annotation.translation 一致，表示 world 坐标系下的
+            3D box 几何中心；size 与 nuScenes size / NUSVIZ V2 SIZE 一致，
+            顺序为 [width, length, height]。
             
         原理：
             1. 从预测字典提取3D框、分数、类别
             2. 过滤低分预测
-            3. 从Ego坐标系转换到全局坐标系
+            3. 按 SparseDrive 官方后处理逻辑从 LiDAR/Ego 坐标系转换到全局坐标系
             4. 提取多模态轨迹并转换坐标
         """
         if sample_token not in self.sample_token_to_prediction:
@@ -171,19 +187,28 @@ class SparseDriveExtractor:
         ego_translation = ego_pose['translation']
         ego_rotation = ensure_quaternion(ego_pose['rotation'])
         
-        # 批量转换坐标
-        translations_local = boxes_3d[:, :2]
-        z_global = boxes_3d[:, 2] + float(ego_translation[2])
+        # SparseDrive boxes_3d[:3] 和 nuScenes sample_annotation.translation
+        # 都表示 3D box 的几何中心，但 SparseDrive/mmdet3d 检测框通常先在
+        # LIDAR_TOP 坐标系下表达。这里先归一到 ego，再做完整 ego -> world
+        # 刚体变换，保证 CENTER 与 nuScenes GT translation 语义一致。
+        centers_local = boxes_3d[:, :3]
         yaws_local = boxes_3d[:, 6]
-        sizes = boxes_3d[:, 3:6]
+        # SparseDrive 官方导出到 nuScenesBox 时使用:
+        #   nus_box_dims = box_dims[:, [1, 0, 2]]
+        # 因此 boxes_3d 的尺寸为 LiDAR box convention [length, width, height]，
+        # 而 nuScenes annotation.size 和 NUSVIZ V2 SIZE 都需要 [width, length, height]。
+        sizes = boxes_3d[:, [4, 3, 5]]
         velocities = boxes_3d[:, 7:9]
         
         # 转换到全局坐标系
         from nuscenes.prediction.helper import convert_local_coords_to_global
-        translations_global = convert_local_coords_to_global(
-            translations_local, ego_translation, ego_rotation
+        centers_ego, yaw_offset = self._detection_centers_to_ego(sample_token, centers_local)
+        translations_global = self._ego_centers_to_global(
+            centers_ego,
+            ego_translation,
+            ego_rotation,
         )
-        yaws_global = yaws_local + ego_pose['yaw']
+        yaws_global = yaws_local + yaw_offset + ego_pose['yaw']
         
         # 构建结果
         detections = []
@@ -206,7 +231,7 @@ class SparseDriveExtractor:
                 'translation': [
                     float(translations_global[i][0]),
                     float(translations_global[i][1]),
-                    float(z_global[i]),
+                    float(translations_global[i][2]),
                 ],
                 'yaw': float(yaws_global[i]),
                 'size': sizes[i].tolist(),
@@ -218,6 +243,49 @@ class SparseDriveExtractor:
             detections.append(detection)
         
         return detections
+
+    def _detection_centers_to_ego(
+        self,
+        sample_token: str,
+        centers_local: np.ndarray,
+    ) -> tuple[np.ndarray, float]:
+        """将 SparseDrive 检测框中心从其输出坐标系转换到 ego 坐标系。"""
+        if self.detection_box_frame == "ego":
+            return centers_local.astype(np.float32), 0.0
+
+        cs_rec = self._get_lidar_calibrated_sensor(sample_token)
+        sensor_translation = np.asarray(cs_rec['translation'], dtype=np.float32)
+        sensor_rotation = ensure_quaternion(cs_rec['rotation'])
+        centers_ego = (
+            sensor_rotation.rotation_matrix @ centers_local.T
+        ).T + sensor_translation
+
+        from nuscenes.eval.common.utils import quaternion_yaw
+
+        return centers_ego.astype(np.float32), float(quaternion_yaw(sensor_rotation))
+
+    def _ego_centers_to_global(
+        self,
+        centers_ego: np.ndarray,
+        ego_translation: List[float],
+        ego_rotation,
+    ) -> np.ndarray:
+        """将 ego 坐标系下的 3D box center 转换到 nuScenes world 坐标系。"""
+        return (
+            ego_rotation.rotation_matrix @ centers_ego.T
+        ).T + np.asarray(ego_translation, dtype=np.float32)
+
+    def _get_lidar_calibrated_sensor(self, sample_token: str) -> Dict[str, Any]:
+        nusc = getattr(self.nuscenes_extractor, "nusc", None)
+        if nusc is None:
+            raise ValueError(
+                "detection_box_frame='lidar' requires nuscenes_extractor.nusc "
+                "to read LIDAR_TOP calibrated_sensor"
+            )
+
+        sample = nusc.get('sample', sample_token)
+        lidar_sd = nusc.get('sample_data', sample['data']['LIDAR_TOP'])
+        return nusc.get('calibrated_sensor', lidar_sd['calibrated_sensor_token'])
     
     def extract_planning(self, sample_token: str) -> List[List[float]]:
         """
