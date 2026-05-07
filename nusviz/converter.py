@@ -29,6 +29,7 @@ OUTPUT_ROOT       = "/home/zhangxueyou/PycharmProjects/nuscenes-data-converter/n
 SPARSEDRIVE_PREDICTION = str(
     _REPO_ROOT / "data/sparsedrive/sparsedrive_stage2_trainval_with_metric.pkl"
 )
+AGGREGATED_METRICS = str(_REPO_ROOT / "aggregated_metrics.json")
 DEFAULT_SPLIT     = "val"
 
 _SPLIT_SCENE_NAMES = {
@@ -72,11 +73,14 @@ class NuScenesConverter:
         version: str = NUSCENES_VERSION,
         output_root: str = OUTPUT_ROOT,
         sparsedrive_prediction: Optional[str] = SPARSEDRIVE_PREDICTION,
+        aggregated_metrics: Optional[str] = None,
     ):
         self.dataroot    = dataroot
         self.version     = version
         self.output_root = Path(output_root)
         self.sparsedrive_prediction = sparsedrive_prediction
+        self.aggregated_metrics_path = aggregated_metrics
+        self.aggregated_metrics = self._load_aggregated_metrics(aggregated_metrics)
 
         print(f"Loading nuScenes {version} from {dataroot}...")
         self.nusc = NuScenes(version=version, dataroot=dataroot, verbose=True)
@@ -149,6 +153,8 @@ class NuScenesConverter:
                 scene_token,
                 dataroot=self.dataroot,
                 sample_tokens=samples,
+                sparsedrive_extractor=self.sd_extractor,
+                scene_metrics=self.aggregated_metrics.get(scene_name),
             ).build()
         )
 
@@ -268,6 +274,21 @@ class NuScenesConverter:
             if self.sd_extractor.has_prediction(sample_token)
         ]
 
+    def _load_aggregated_metrics(self, aggregated_metrics: Optional[str]) -> Dict[str, Dict[str, List[object]]]:
+        if not aggregated_metrics:
+            return {}
+
+        metrics_path = Path(aggregated_metrics)
+        if not metrics_path.exists():
+            raise FileNotFoundError(f"Aggregated metrics file not found: {aggregated_metrics}")
+
+        print(f"Loading aggregated metrics from {metrics_path}...")
+        with metrics_path.open("r") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError(f"Aggregated metrics root must be an object: {aggregated_metrics}")
+        return data
+
     def _get_planning_trajectory(self, sample_token: str) -> Optional[List[List[float]]]:
         """
         提取 SparseDrive final_planning 并补齐为 NUSVIZ VEC3 轨迹。
@@ -386,6 +407,12 @@ def _default_prediction_path() -> Optional[str]:
     return str(path) if path.exists() else None
 
 
+def _default_aggregated_metrics_path() -> Optional[str]:
+    """Return the repo-local aggregated metrics JSON when available."""
+    path = Path(AGGREGATED_METRICS)
+    return str(path) if path.exists() else None
+
+
 def main():
     parser = argparse.ArgumentParser(description="Convert nuScenes scenes to NUSVIZ GLB format.")
     parser.add_argument("--dataroot", default=NUSCENES_DATAROOT, help="nuScenes dataset root")
@@ -401,15 +428,25 @@ def main():
             "when it exists; pass an empty string to disable planning."
         ),
     )
+    parser.add_argument(
+        "--aggregated-metrics",
+        default=_default_aggregated_metrics_path(),
+        help=(
+            "Aggregated per-scene metrics JSON path. Defaults to repo-local "
+            "aggregated_metrics.json when it exists; pass an empty string to disable."
+        ),
+    )
     args = parser.parse_args()
 
     sparsedrive_prediction = args.sparsedrive_prediction or None
+    aggregated_metrics = args.aggregated_metrics or None
 
     converter = NuScenesConverter(
         dataroot=args.dataroot,
         version=args.version,
         output_root=args.output_root,
         sparsedrive_prediction=sparsedrive_prediction,
+        aggregated_metrics=aggregated_metrics,
     )
 
     if args.scene_name:
@@ -421,6 +458,7 @@ def main():
     print(f"Conversion complete!")
     print(f"Output directory: {args.output_root}")
     print(f"SparseDrive planning: {'enabled' if sparsedrive_prediction else 'disabled'}")
+    print(f"Aggregated metrics: {'enabled' if aggregated_metrics else 'disabled'}")
     print(f"{'='*80}\n")
 
 

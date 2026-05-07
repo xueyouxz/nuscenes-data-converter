@@ -268,6 +268,8 @@ BIN chunk 中所有数据按 4 字节对齐。
 {
   "type": "nuviz/metadata",
   "data": {
+    "scene_name": "scene-0916",
+    "scene_description": "Parked truck, construction, intersection, turn left, following a van",
     "log_info": {
       "start_time": 1533151709.572,
       "end_time": 1533151729.872
@@ -280,6 +282,17 @@ BIN chunk 中所有数据按 4 字节对齐。
   }
 }
 ```
+
+| 字段 | 说明 |
+|---|---|
+| `scene_name` | 场景名称，来自 nuScenes `scene.name` |
+| `scene_description` | 场景描述，来自 nuScenes `scene.description` |
+| `log_info` | 场景时间范围 |
+| `streams` | 场景包含的 stream 声明 |
+| `cameras` | 相机内外参 |
+| `map` | 静态地图和底图 payload |
+| `statistics` | 与 message 帧对齐的场景统计 |
+| `extensions` | 数据集或生产方扩展字段 |
 
 ### 6.1 cameras
 
@@ -339,7 +352,7 @@ BIN chunk 中所有数据按 4 字节对齐。
 
 ### 6.3 statistics
 
-`statistics` 存储场景级统计时间序列。`timeline` 和 `ego_state` 使用按帧对齐的 dense 数组，数组长度与 `message_index.json.messages` 一致。对象计数使用 sparse 数组，仅记录非零帧。
+`statistics` 存储场景级统计时间序列。`timeline` 和 `ego_state` 使用按帧对齐的 dense 数组，数组长度与 `message_index.json.messages` 一致。对象计数使用 sparse 数组，仅记录非零帧。若场景包含 SparseDrive 预测，`object_counts` 同时写入 `/pred/sparsedrive/objects/bounds` 的预测对象数量统计。
 
 ```json
 {
@@ -398,6 +411,28 @@ BIN chunk 中所有数据按 4 字节对齐。
         }
       }
     }
+  },
+  "metrics": {
+    "collision": {
+      "values": "#/accessors/N+17",
+      "unit": "boolean",
+      "dtype": "uint8"
+    },
+    "detection": {
+      "values": "#/accessors/N+18",
+      "unit": "score",
+      "dtype": "float32"
+    },
+    "mapping": {
+      "values": "#/accessors/N+19",
+      "unit": "score",
+      "dtype": "float32"
+    },
+    "planning": {
+      "values": "#/accessors/N+20",
+      "unit": "score",
+      "dtype": "float32"
+    }
   }
 }
 ```
@@ -417,6 +452,9 @@ BIN chunk 中所有数据按 4 字节对齐。
 | `object_counts.<stream>.total.values` | 对象总数非零帧对应的对象数量 |
 | `object_counts.<stream>.categories.<name>.frame_indices` | 指定类别对象数非零的帧索引 |
 | `object_counts.<stream>.categories.<name>.values` | 指定类别对象数非零帧对应的对象数量 |
+| `metrics.<name>.values` | 每帧指标值，数组长度为 `frame_count` |
+| `metrics.<name>.unit` | 指标单位，数值评分为 `score`，碰撞标记为 `boolean` |
+| `metrics.<name>.dtype` | 指标 accessor 数据类型 |
 
 #### statistics accessor 格式
 
@@ -429,8 +467,11 @@ BIN chunk 中所有数据按 4 字节对齐。
 | `object_counts.<stream>.total.values` | SCALAR | uint32 | `(K,)` | 对象总数非零帧对应的对象数量 |
 | `object_counts.<stream>.categories.*.frame_indices` | SCALAR | uint32 | `(C,)` | 指定类别非零的帧索引 |
 | `object_counts.<stream>.categories.*.values` | SCALAR | uint32 | `(C,)` | 指定类别非零帧对应的对象数量 |
+| `metrics.collision.values` | SCALAR | uint8 | `(F,)` | 碰撞标记，`0=false`，`1=true` |
+| `metrics.<numeric>.values` | SCALAR | float32 | `(F,)` | 数值型指标，写入前保留两位有效数字 |
 
 `F = frame_count`。`K` 和 `C` 为稀疏序列长度。对象计数中未记录的帧隐含计数为 `0`；某个类别在整个场景中从未出现时，不写入该类别字段。若某个统计项不可用，可以省略对应字段。
+若提供 `aggregated_metrics.json`，转换器按场景名称读取 `detection`、`mapping`、`planning`、`collision` 等逐关键帧指标；指标数组长度必须与当前场景 message 数量一致，否则转换失败以避免帧错位。
 
 ---
 

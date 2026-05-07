@@ -89,12 +89,16 @@ class MetadataBuilder:
         scene_token: str,
         dataroot: Optional[str] = None,
         sample_tokens: Optional[List[str]] = None,
+        sparsedrive_extractor: Optional[Any] = None,
+        scene_metrics: Optional[Dict[str, Any]] = None,
     ):
         self.nusc = nusc
         self.scene = nusc.get('scene', scene_token)
         # dataroot 用于实例化 NuScenesMap；若未传入则从 nusc 对象获取
         self.dataroot = dataroot or nusc.dataroot
         self.sample_tokens = sample_tokens
+        self.sparsedrive_extractor = sparsedrive_extractor
+        self.scene_metrics = scene_metrics
 
     def build(self) -> bytes:
         """构建并返回 metadata.glb 的字节内容。"""
@@ -172,6 +176,8 @@ class MetadataBuilder:
         metadata = {
             "type": "nuviz/metadata",
             "data": {
+                "scene_name": scene['name'],
+                "scene_description": scene['description'],
                 "log_info": {
                     "start_time": start_time,
                     "end_time":   end_time,
@@ -327,33 +333,36 @@ class MetadataBuilder:
         gt_counts = self._build_gt_object_count_statistics(encoder, sample_tokens)
         if gt_counts:
             statistics["object_counts"]["/gt/objects/bounds"] = gt_counts
+        pred_counts = self._build_pred_object_count_statistics(encoder, sample_tokens)
+        if pred_counts:
+            statistics["object_counts"]["/pred/sparsedrive/objects/bounds"] = pred_counts
+        metrics = self._build_metric_statistics(encoder, sample_tokens)
+        if metrics:
+            statistics["metrics"] = metrics
         return statistics
 
-    def _build_gt_object_count_statistics(
+    def _encode_object_count_statistics(
         self,
         encoder: GLBEncoder,
-        sample_tokens: List[str],
+        frame_category_counts: List[Dict[str, int]],
     ) -> Dict[str, Any]:
+        """将逐帧类别计数编码为 NUSVIZ V2 sparse object_counts payload。"""
         total_frames: List[int] = []
         total_values: List[int] = []
         category_frames: Dict[str, List[int]] = defaultdict(list)
         category_values: Dict[str, List[int]] = defaultdict(list)
 
-        for frame_idx, sample_token in enumerate(sample_tokens):
-            sample = self.nusc.get('sample', sample_token)
-            if sample['anns']:
+        for frame_idx, counts in enumerate(frame_category_counts):
+            total = int(sum(counts.values()))
+            if total > 0:
                 total_frames.append(frame_idx)
-                total_values.append(len(sample['anns']))
-
-            counts: Dict[str, int] = defaultdict(int)
-            for ann_token in sample['anns']:
-                ann = self.nusc.get('sample_annotation', ann_token)
-                category = self._resolve_gt_category(ann['category_name'])
-                counts[category] += 1
+                total_values.append(total)
 
             for category, count in counts.items():
+                if count <= 0:
+                    continue
                 category_frames[category].append(frame_idx)
-                category_values[category].append(count)
+                category_values[category].append(int(count))
 
         if not total_frames:
             return {}
@@ -378,6 +387,98 @@ class MetadataBuilder:
                 "values": f"#/accessors/{value_acc}",
             }
         return payload
+
+    def _build_gt_object_count_statistics(
+        self,
+        encoder: GLBEncoder,
+        sample_tokens: List[str],
+    ) -> Dict[str, Any]:
+        frame_category_counts: List[Dict[str, int]] = []
+
+        for sample_token in sample_tokens:
+            sample = self.nusc.get('sample', sample_token)
+            counts: Dict[str, int] = defaultdict(int)
+            for ann_token in sample['anns']:
+                ann = self.nusc.get('sample_annotation', ann_token)
+                category = self._resolve_gt_category(ann['category_name'])
+                counts[category] += 1
+
+            frame_category_counts.append(dict(counts))
+
+        return self._encode_object_count_statistics(encoder, frame_category_counts)
+
+    def _build_pred_object_count_statistics(
+        self,
+        encoder: GLBEncoder,
+        sample_tokens: List[str],
+    ) -> Dict[str, Any]:
+        """统计 SparseDrive 预测对象数量，帧索引与 message_index.messages 对齐。"""
+        if self.sparsedrive_extractor is None:
+            return {}
+
+        frame_category_counts: List[Dict[str, int]] = []
+        for sample_token in sample_tokens:
+            counts: Dict[str, int] = defaultdict(int)
+            if self.sparsedrive_extractor.has_prediction(sample_token):
+                for detection in self.sparsedrive_extractor.extract_detections(sample_token):
+                    category = detection.get('category', 'unknown')
+                    counts[category] += 1
+            frame_category_counts.append(dict(counts))
+
+        return self._encode_object_count_statistics(encoder, frame_category_counts)
+
+    def _build_metric_statistics(
+        self,
+        encoder: GLBEncoder,
+        sample_tokens: List[str],
+    ) -> Dict[str, Any]:
+        """将 aggregated_metrics.json 中的逐关键帧指标写入 metadata statistics。"""
+        if not self.scene_metrics:
+            return {}
+
+        frame_count = len(sample_tokens)
+        metric_payload: Dict[str, Any] = {}
+
+        for metric_name in sorted(self.scene_metrics):
+            values = self.scene_metrics[metric_name]
+            if not isinstance(values, list):
+                continue
+            if len(values) != frame_count:
+                raise ValueError(
+                    f"Metric length mismatch for {self.scene['name']}.{metric_name}: "
+                    f"metrics={len(values)}, frames={frame_count}"
+                )
+
+            if metric_name == "collision":
+                arr = np.array([1 if bool(value) else 0 for value in values], dtype=np.uint8)
+                acc = encoder.add_accessor(arr, type_str="SCALAR")
+                metric_payload[metric_name] = {
+                    "values": f"#/accessors/{acc}",
+                    "unit": "boolean",
+                    "dtype": "uint8",
+                }
+                continue
+
+            rounded = np.array(
+                [self._round_two_significant_digits(value) for value in values],
+                dtype=np.float32,
+            )
+            acc = encoder.add_accessor(rounded, type_str="SCALAR")
+            metric_payload[metric_name] = {
+                "values": f"#/accessors/{acc}",
+                "unit": "score",
+                "dtype": "float32",
+            }
+
+        return metric_payload
+
+    def _round_two_significant_digits(self, value: Any) -> float:
+        if value is None:
+            return float("nan")
+        numeric = float(value)
+        if not np.isfinite(numeric):
+            return numeric
+        return float(f"{numeric:.2g}")
 
     def _resolve_gt_category(self, category_name: str) -> str:
         if "vehicle.car" in category_name:
